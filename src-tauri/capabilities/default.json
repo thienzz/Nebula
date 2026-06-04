@@ -15,6 +15,5 @@
     "fs:allow-read-file",
     "fs:allow-mkdir",
     "fs:allow-watch"
-  ],
-  "//": "SECURITY MODEL (TC-SEC-002): start with an EMPTY fs scope. When the user selects a Vault, the Rust `fs_scope` module adds ONLY that directory (recursive) to the allowed scope at runtime and rejects any path that escapes it (OUTSIDE_VAULT). Never widen this to the whole disk. All feature code goes through the fs_scope choke point (CODING-STANDARDS §4)."
+  ]
 }

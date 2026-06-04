@@ -8,7 +8,7 @@ mod model_manager; // download/verify/cache/select (T-043/044/045/060)
 mod capability; // WebGPU/RAM/disk + chat-readiness (T-040/049)
 mod logger; // opt-in metadata-only logs (T-065)
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 /// Maps to the shared error catalog (API-CONTRACTS §4).
 #[derive(Debug, thiserror::Error, Serialize)]

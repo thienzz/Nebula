@@ -32,6 +32,5 @@
     "active": true,
     "targets": ["nsis", "msi"],
     "icon": ["icons/icon.ico"]
-  },
-  "//": "GATE A: the COOP/COEP headers above must make self.crossOriginIsolated === true in the packaged app, not just dev. connect-src allows ONLY the model-download hosts — keep this tight (NFR-SEC-001). Phase 2: add macos/linux bundle targets. The Vault FS scope is set at runtime via the fs plugin capability, NOT a static allowlist, because the Vault path is user-chosen (see capabilities/default.json)."
+  }
 }
