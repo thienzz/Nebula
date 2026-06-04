@@ -1,0 +1,7 @@
+# Normalize line endings. Keep shell scripts LF so they run in the devcontainer.
+* text=auto eol=lf
+*.sh text eol=lf
+*.png binary
+*.ico binary
+*.bin binary
+*.onnx binary

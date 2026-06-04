@@ -8,7 +8,17 @@ import { defineConfig } from 'vite';
 // Verify `self.crossOriginIsolated === true` at runtime (Phase 0 GATE A).
 const crossOriginIsolation = {
   name: 'cross-origin-isolation',
-  configureServer(server: { middlewares: { use: (fn: (req: unknown, res: { setHeader: (k: string, v: string) => void }, next: () => void) => void) => void } }) {
+  configureServer(server: {
+    middlewares: {
+      use: (
+        fn: (
+          req: unknown,
+          res: { setHeader: (k: string, v: string) => void },
+          next: () => void
+        ) => void
+      ) => void;
+    };
+  }) {
     server.middlewares.use((_req, res, next) => {
       res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
       res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
