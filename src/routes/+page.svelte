@@ -14,6 +14,24 @@
   import { intake } from '$lib/ingest/intake';
   import { csvToMarkdown } from '$lib/ingest/csv';
   import { buildProxyNote, proxyNotePath } from '$lib/ingest/proxy';
+  import { createNote, updateNote, validateDraft } from '$lib/vault/note-crud';
+  import { serializeNote } from '$lib/vault/note';
+  import {
+    renderWikilinks,
+    buildBacklinks,
+    findUnlinkedMentions,
+    autocompleteWikilink,
+    applyWikilinkChoice,
+    type AutocompleteState
+  } from '$lib/weave/wikilink';
+  import { quickSwitch, type SwitchResult } from '$lib/nav/switcher';
+  import {
+    BUILTIN_TEMPLATES,
+    expandTemplate,
+    dailyNoteTitle,
+    dailyNotePath,
+    dailyNoteBody
+  } from '$lib/vault/template';
 
   type Note = {
     docId: string;
@@ -69,6 +87,12 @@
     )
   );
 
+  // Vault note bodies for backlink/mention scans (FR-LINK-004/005).
+  const vaultBodies = $derived(
+    vault.map((n) => ({ docId: n.docId, title: n.title, body: n.text, aliases: n.aliases }))
+  );
+  const backlinks = $derived(buildBacklinks(vaultBodies, titleIndex));
+
   let status = $state('starting…');
   let ready = $state(false);
   let modelId = $state(MODELS[0].id);
@@ -90,6 +114,20 @@
   let dropActive = $state(false);
   let fileInput: HTMLInputElement;
 
+  // Note editor (FR-NOTE-001/003, FR-UI-002) — the left pane's "Write" mode.
+  let mode = $state<'ask' | 'write'>('ask');
+  let draftTitle = $state('');
+  let draftBody = $state('');
+  let editingDocId = $state<string | null>(null); // null → creating a new note
+  let editMsg = $state('');
+  let savingNote = $state(false);
+  let bodyEl = $state<HTMLTextAreaElement>();
+  let wlState = $state<AutocompleteState | null>(null); // wikilink autocomplete (FR-LINK-003)
+
+  // Quick switcher (FR-NAV-001).
+  let switcherOpen = $state(false);
+  let switcherQuery = $state('');
+
   // 40/60 resizable split (FR-UI-001).
   let leftPct = $state(40);
   let splitEl: HTMLDivElement;
@@ -101,6 +139,7 @@
     search: (v: number[], k: number) => Promise<SearchHit[]>;
     relate: (qid: string, hs: SearchHit[]) => Promise<void>;
     ingest: (docId: string, text: string) => Promise<void>;
+    removeDoc: (docId: string) => Promise<void>;
     provider: {
       loadModel: (m: string, cb: (p: number) => void) => Promise<void>;
       generate: (
@@ -177,6 +216,7 @@
           hs.map((h) => ({ chunkId: h.chunkId, score: h.score }))
         ),
       ingest: indexNote,
+      removeDoc: (docId) => store.deleteDoc(docId),
       provider
     };
     status = 'ready';
@@ -258,6 +298,122 @@
     e.preventDefault();
     dropActive = false;
     void ingestFiles(e.dataTransfer?.files ?? null);
+  }
+
+  // --- Note editor (FR-NOTE-001/003, FR-UI-002) ------------------------------
+  // Author a note → write a portable `.md` (frontmatter + body) → index it immediately so it is
+  // searchable, citable, weave-linkable, and exportable to any LLM (Export Vault / Context Compiler).
+  function startNewNote() {
+    editingDocId = null;
+    draftTitle = '';
+    draftBody = '';
+    editMsg = '';
+    mode = 'write';
+  }
+
+  function editNote(note: Note) {
+    editingDocId = note.docId;
+    draftTitle = String(note.frontmatter?.title ?? note.title ?? '');
+    draftBody = note.text;
+    editMsg = '';
+    mode = 'write';
+  }
+
+  async function saveNote() {
+    if (!pipe || !ready || savingNote) return;
+    const v = validateDraft({ title: draftTitle, body: draftBody });
+    if (!v.ok) {
+      editMsg = v.reason;
+      return;
+    }
+    savingNote = true;
+    editMsg = 'saving…';
+    try {
+      const nowIso = new Date().toISOString();
+      let file;
+      if (editingDocId) {
+        const existing = vault.find((n) => n.docId === editingDocId);
+        const currentMd = serializeNote({
+          frontmatter: existing?.frontmatter ?? { title: existing?.title ?? draftTitle },
+          body: existing?.text ?? ''
+        });
+        file = await updateNote({
+          docId: editingDocId,
+          markdown: currentMd,
+          title: draftTitle,
+          body: draftBody,
+          now: nowIso
+        });
+        await pipe.removeDoc(editingDocId); // drop stale chunks before re-indexing the new body
+      } else {
+        file = await createNote({
+          title: draftTitle,
+          body: draftBody,
+          now: nowIso,
+          existingPaths: vault.map((n) => n.docId)
+        });
+      }
+      await pipe.ingest(file.docId, draftBody); // searchable + citable immediately
+      const title = String(file.note.frontmatter.title ?? draftTitle);
+      vault = [
+        ...vault.filter((n) => n.docId !== file.docId && n.docId !== editingDocId),
+        {
+          docId: file.docId,
+          title,
+          aliases: [],
+          text: draftBody,
+          kind: 'note',
+          frontmatter: file.note.frontmatter
+        }
+      ];
+      editMsg = `✓ saved ${file.docId}`;
+      editingDocId = file.docId;
+      mode = 'ask';
+      showSource(file.docId);
+    } catch (e) {
+      editMsg = 'error: ' + (e instanceof Error ? e.message : String(e));
+    } finally {
+      savingNote = false;
+    }
+  }
+
+  // Insert a template into the editor body (FR-NOTE-006), expanding {{date}}/{{title}}/… for now.
+  function applyTemplate(id: string) {
+    const t = BUILTIN_TEMPLATES.find((x) => x.id === id);
+    if (!t) return;
+    draftBody = expandTemplate(t.body, { now: new Date().toISOString(), title: draftTitle });
+    wlState = null;
+  }
+
+  // Open today's daily note, creating it from the daily template if it doesn't exist (FR-NOTE-005).
+  async function openDailyNote() {
+    if (!pipe || !ready) return;
+    const nowIso = new Date().toISOString();
+    const path = dailyNotePath(nowIso);
+    if (vault.some((n) => n.docId === path)) {
+      showSource(path);
+      return;
+    }
+    const body = dailyNoteBody(nowIso);
+    const file = await createNote({
+      title: dailyNoteTitle(nowIso),
+      body,
+      now: nowIso,
+      existingPaths: vault.map((n) => n.docId)
+    });
+    await pipe.ingest(file.docId, body);
+    vault = [
+      ...vault,
+      {
+        docId: file.docId,
+        title: String(file.note.frontmatter.title ?? dailyNoteTitle(nowIso)),
+        aliases: [],
+        text: body,
+        kind: 'note',
+        frontmatter: file.note.frontmatter
+      }
+    ];
+    showSource(file.docId);
   }
 
   async function ask() {
@@ -378,12 +534,77 @@
   }
 
   const activeNote = $derived(activeDoc ? vault.find((n) => n.docId === activeDoc) : undefined);
+  const activeBacklinks = $derived(activeDoc ? (backlinks.get(activeDoc) ?? []) : []);
+  const activeUnlinked = $derived(
+    activeNote
+      ? findUnlinkedMentions(
+          { docId: activeNote.docId, title: activeNote.title, aliases: activeNote.aliases },
+          vaultBodies
+        )
+      : []
+  );
+
+  // --- Wikilink autocomplete (FR-LINK-003) ---------------------------------
+  function onBodyInput() {
+    if (!bodyEl) return;
+    wlState = autocompleteWikilink(
+      draftBody,
+      bodyEl.selectionStart ?? draftBody.length,
+      titleIndex
+    );
+  }
+  async function pickWikilink(title: string) {
+    if (!wlState) return;
+    const res = applyWikilinkChoice(draftBody, wlState, title);
+    draftBody = res.text;
+    wlState = null;
+    await tick();
+    if (bodyEl) {
+      bodyEl.focus();
+      bodyEl.setSelectionRange(res.caret, res.caret);
+    }
+  }
+
+  // --- Quick switcher (FR-NAV-001) -----------------------------------------
+  const switcherResults = $derived<SwitchResult[]>(
+    switcherOpen
+      ? quickSwitch(
+          vault.map((n) => ({ docId: n.docId, title: n.title })),
+          switcherQuery,
+          10
+        )
+      : []
+  );
+  async function openSwitcher() {
+    switcherQuery = '';
+    switcherOpen = true;
+    await tick();
+    document.getElementById('switcher-input')?.focus();
+  }
+  function chooseSwitch(docId: string) {
+    switcherOpen = false;
+    showSource(docId);
+  }
+  function onGlobalKey(e: KeyboardEvent) {
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'o')) {
+      e.preventDefault();
+      void openSwitcher();
+    } else if (e.key === 'Escape') {
+      switcherOpen = false;
+      wlState = null;
+    }
+  }
 </script>
+
+<svelte:window onkeydown={onGlobalKey} />
 
 <main class="shell">
   <header class="topbar">
     <span class="brand">✦ Nebula</span>
     <span class="tag">local-first RAG · Obsidian DNA</span>
+    <button class="eject" onclick={openSwitcher} title="Quick switch to a note (Ctrl/⌘+K)">
+      ⌘K Switch
+    </button>
     <button
       class="eject"
       onclick={exportVault}
@@ -398,91 +619,174 @@
   <div class="split" bind:this={splitEl}>
     <!-- LEFT (40%) — the Active/Command zone: chat + Micro-Map -->
     <section class="pane chat" style="width: {leftPct}%" aria-label="Chat">
-      <h2>Ask your vault</h2>
-
-      <div class="controls">
-        <select bind:value={modelId} disabled={busy}>
-          {#each MODELS as m (m.id)}<option value={m.id}>{m.label}</option>{/each}
-        </select>
+      <div class="modes" role="tablist" aria-label="Left pane mode">
+        <button
+          class="modetab"
+          class:active={mode === 'ask'}
+          role="tab"
+          aria-selected={mode === 'ask'}
+          onclick={() => (mode = 'ask')}>Ask</button
+        >
+        <button
+          class="modetab"
+          class:active={mode === 'write'}
+          role="tab"
+          aria-selected={mode === 'write'}
+          onclick={() => (mode = 'write')}>✎ Write</button
+        >
       </div>
 
-      <textarea bind:value={query} rows="2" placeholder="Ask a question…" disabled={busy}
-      ></textarea>
-      <button class="ask" onclick={ask} disabled={!ready || busy}
-        >{busy ? 'Working…' : 'Ask'}</button
-      >
+      {#if mode === 'ask'}
+        <div class="controls">
+          <select bind:value={modelId} disabled={busy}>
+            {#each MODELS as m (m.id)}<option value={m.id}>{m.label}</option>{/each}
+          </select>
+        </div>
 
-      {#if hits.length}
-        <div class="sources">
-          <div class="block-h">Retrieved sources</div>
-          {#each hits as h, i (h.chunkId)}
-            <button class="src" onclick={() => jumpTo(h.chunkId)}>
-              <span class="src-n">[#{i + 1}]</span>
-              {h.docId} <span class="score">{h.score.toFixed(2)}</span>
+        <textarea bind:value={query} rows="2" placeholder="Ask a question…" disabled={busy}
+        ></textarea>
+        <button class="ask" onclick={ask} disabled={!ready || busy}
+          >{busy ? 'Working…' : 'Ask'}</button
+        >
+
+        {#if hits.length}
+          <div class="sources">
+            <div class="block-h">Retrieved sources</div>
+            {#each hits as h, i (h.chunkId)}
+              <button class="src" onclick={() => jumpTo(h.chunkId)}>
+                <span class="src-n">[#{i + 1}]</span>
+                {h.docId} <span class="score">{h.score.toFixed(2)}</span>
+              </button>
+            {/each}
+          </div>
+        {/if}
+
+        {#if graph}
+          <div class="micromap">
+            <div class="block-h">Micro-Map · how the AI answered</div>
+            <svg
+              width="100%"
+              height={40 + graph.nodes.filter((n) => n.kind === 'chunk').length * 30}
+              class="graph"
+            >
+              {#each graph.edges as e, i (e.to)}
+                {@const cy = 30 + i * 30}
+                <line
+                  x1="78"
+                  y1="24"
+                  x2="76%"
+                  y2={cy}
+                  stroke="#6750a4"
+                  stroke-width={e.width}
+                  stroke-opacity="0.55"
+                />
+              {/each}
+              <circle cx="40" cy="24" r="9" fill="#6750a4" />
+              <text x="40" y="44" text-anchor="middle" class="g-label">query</text>
+              {#each graph.nodes.filter((n) => n.kind === 'chunk') as n, i (n.id)}
+                {@const cy = 30 + i * 30}
+                <circle cx="76%" {cy} r="6" fill="#efeaf8" stroke="#6750a4" />
+                <text x="80%" y={cy + 4} class="g-label">{n.label} · {n.score}</text>
+              {/each}
+            </svg>
+          </div>
+        {/if}
+
+        {#if answer}
+          <div class="answer">
+            <div class="block-h">Answer</div>
+            {#if woven.length}
+              <p>
+                {#each woven as seg, i (i)}
+                  {@const link = seg.link}
+                  {#if link}
+                    <button
+                      class="wikilink"
+                      onclick={() => showSource(link.docId)}
+                      onmouseenter={(e) => showPreview(e, link.docId)}
+                      onmouseleave={hidePreview}>{seg.text}</button
+                    >
+                  {:else}{seg.text}{/if}
+                {/each}
+              </p>
+            {:else}
+              <p>{answer}</p>
+            {/if}
+            {#if cites.length}
+              <div class="cites">
+                cited:
+                {#each cites as c (c.chunkId)}
+                  <button class="chip" onclick={() => jumpTo(c.chunkId)}>[#{c.n}] {c.docId}</button>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        {/if}
+      {:else}
+        <div class="editor">
+          <div class="editor-top">
+            <input
+              class="title-input"
+              bind:value={draftTitle}
+              placeholder="Note title"
+              disabled={savingNote}
+            />
+            <select
+              class="tpl-select"
+              disabled={savingNote}
+              title="Insert a template"
+              onchange={(e) => {
+                const el = e.currentTarget;
+                applyTemplate(el.value);
+                el.selectedIndex = 0;
+              }}
+            >
+              <option value="">Template ▾</option>
+              {#each BUILTIN_TEMPLATES as t (t.id)}
+                <option value={t.id}>{t.label}</option>
+              {/each}
+            </select>
+          </div>
+          <div class="body-wrap">
+            <textarea
+              class="body-input"
+              bind:this={bodyEl}
+              bind:value={draftBody}
+              rows="14"
+              placeholder="Write your note in Markdown… type [[ to link a note"
+              disabled={savingNote}
+              oninput={onBodyInput}
+              onkeyup={onBodyInput}
+              onclick={onBodyInput}
+            ></textarea>
+            {#if wlState && wlState.suggestions.length}
+              <ul class="wl-menu">
+                {#each wlState.suggestions as s (s.docId)}
+                  <li>
+                    <button
+                      class="wl-item"
+                      onmousedown={(e) => e.preventDefault()}
+                      onclick={() => pickWikilink(s.title)}
+                    >
+                      <span class="wl-title">{s.title}</span>
+                      <span class="wl-doc">{s.docId}</span>
+                    </button>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+          </div>
+          <div class="editor-actions">
+            <button class="ask" onclick={saveNote} disabled={!ready || savingNote}>
+              {savingNote ? 'Saving…' : editingDocId ? 'Save changes' : 'Save note'}
             </button>
-          {/each}
-        </div>
-      {/if}
-
-      {#if graph}
-        <div class="micromap">
-          <div class="block-h">Micro-Map · how the AI answered</div>
-          <svg
-            width="100%"
-            height={40 + graph.nodes.filter((n) => n.kind === 'chunk').length * 30}
-            class="graph"
-          >
-            {#each graph.edges as e, i (e.to)}
-              {@const cy = 30 + i * 30}
-              <line
-                x1="78"
-                y1="24"
-                x2="76%"
-                y2={cy}
-                stroke="#6750a4"
-                stroke-width={e.width}
-                stroke-opacity="0.55"
-              />
-            {/each}
-            <circle cx="40" cy="24" r="9" fill="#6750a4" />
-            <text x="40" y="44" text-anchor="middle" class="g-label">query</text>
-            {#each graph.nodes.filter((n) => n.kind === 'chunk') as n, i (n.id)}
-              {@const cy = 30 + i * 30}
-              <circle cx="76%" {cy} r="6" fill="#efeaf8" stroke="#6750a4" />
-              <text x="80%" y={cy + 4} class="g-label">{n.label} · {n.score}</text>
-            {/each}
-          </svg>
-        </div>
-      {/if}
-
-      {#if answer}
-        <div class="answer">
-          <div class="block-h">Answer</div>
-          {#if woven.length}
-            <p>
-              {#each woven as seg, i (i)}
-                {@const link = seg.link}
-                {#if link}
-                  <button
-                    class="wikilink"
-                    onclick={() => showSource(link.docId)}
-                    onmouseenter={(e) => showPreview(e, link.docId)}
-                    onmouseleave={hidePreview}>{seg.text}</button
-                  >
-                {:else}{seg.text}{/if}
-              {/each}
-            </p>
-          {:else}
-            <p>{answer}</p>
-          {/if}
-          {#if cites.length}
-            <div class="cites">
-              cited:
-              {#each cites as c (c.chunkId)}
-                <button class="chip" onclick={() => jumpTo(c.chunkId)}>[#{c.n}] {c.docId}</button>
-              {/each}
-            </div>
-          {/if}
+            <button class="ghost" onclick={startNewNote} disabled={savingNote}>＋ New</button>
+            {#if editMsg}<span class="editmsg">{editMsg}</span>{/if}
+          </div>
+          <p class="editor-hint">
+            Saved as a portable <code>.md</code> in <code>notes/</code> — instantly searchable, citable,
+            and exportable to any LLM via Export Vault / the Context Compiler.
+          </p>
         </div>
       {/if}
     </section>
@@ -511,10 +815,16 @@
       ondrop={onDrop}
     >
       <div class="toolbar">
+        <button class="addfiles newnote" onclick={startNewNote} disabled={!ready}>
+          ✎ New note
+        </button>
+        <button class="addfiles newnote" onclick={openDailyNote} disabled={!ready}>
+          📅 Today
+        </button>
         <button class="addfiles" onclick={() => fileInput?.click()} disabled={!ready}>
           ＋ Add files
         </button>
-        <span class="hint">PDF · CSV · TXT · MD — or drop anywhere here</span>
+        <span class="hint">Write a note · or drop PDF · CSV · TXT · MD anywhere here</span>
         {#if importMsg}<span class="importmsg">{importMsg}</span>{/if}
       </div>
       <input
@@ -530,6 +840,9 @@
         <div class="block-h">
           {activeNote.docId}{activeSpan ? ' · cited span highlighted' : ''}
           {#if activeNote.kind}<span class="badge">{activeNote.kind}</span>{/if}
+          {#if !activeNote.sourcePath}
+            <button class="back edit" onclick={() => editNote(activeNote)}>✎ Edit</button>
+          {/if}
           <button class="back" onclick={() => (activeDoc = null)}>✕ vault</button>
         </div>
         {#if activeNote.sourcePath}
@@ -546,9 +859,44 @@
             )}
             {seg.pre}<mark>{seg.hit}</mark>{seg.post}
           {:else}
-            {activeNote.text}
+            {#each renderWikilinks(activeNote.text, titleIndex) as seg, i (i)}
+              {@const link = seg.link}
+              {#if link}
+                <button
+                  class="wikilink"
+                  onclick={() => showSource(link.docId)}
+                  onmouseenter={(e) => showPreview(e, link.docId)}
+                  onmouseleave={hidePreview}>{seg.text}</button
+                >
+              {:else if seg.broken}
+                <span class="broken-link" title="No note named this yet">{seg.text}</span>
+              {:else}{seg.text}{/if}
+            {/each}
           {/if}
         </article>
+
+        {#if activeBacklinks.length || activeUnlinked.length}
+          <div class="links-panel">
+            {#if activeBacklinks.length}
+              <div class="block-h">🔗 Backlinks — {activeBacklinks.length}</div>
+              {#each activeBacklinks as bl (bl.docId)}
+                <button class="src" onclick={() => showSource(bl.docId)}>
+                  {bl.title}
+                  <span class="score">{bl.count > 1 ? `×${bl.count}` : ''} {bl.docId}</span>
+                </button>
+              {/each}
+            {/if}
+            {#if activeUnlinked.length}
+              <div class="block-h">💭 Unlinked mentions — {activeUnlinked.length}</div>
+              {#each activeUnlinked as um (um.docId)}
+                <button class="src" onclick={() => showSource(um.docId)}>
+                  <span class="src-n">{um.title}</span>
+                  <span class="um-snippet">{um.snippet}</span>
+                </button>
+              {/each}
+            {/if}
+          </div>
+        {/if}
       {:else}
         <div class="block-h">Vault — {vault.length} notes</div>
         {#each vault as note (note.docId)}
@@ -566,6 +914,49 @@
 
   {#if preview}
     <div class="popover" style="left: {preview.x}px; top: {preview.y}px">{preview.text}</div>
+  {/if}
+
+  {#if switcherOpen}
+    <!-- Quick switcher (FR-NAV-001) -->
+    <div
+      class="switcher-overlay"
+      role="button"
+      tabindex="-1"
+      aria-label="Close switcher"
+      onclick={() => (switcherOpen = false)}
+      onkeydown={(e) => e.key === 'Enter' && (switcherOpen = false)}
+    >
+      <div
+        class="switcher"
+        role="dialog"
+        tabindex="-1"
+        aria-label="Quick switcher"
+        onclick={(e) => e.stopPropagation()}
+        onkeydown={(e) => {
+          if (e.key === 'Enter' && switcherResults[0]) chooseSwitch(switcherResults[0].docId);
+        }}
+      >
+        <input
+          id="switcher-input"
+          class="switcher-input"
+          bind:value={switcherQuery}
+          placeholder="Jump to a note…"
+          autocomplete="off"
+        />
+        <ul class="switcher-list">
+          {#each switcherResults as r (r.docId)}
+            <li>
+              <button class="switcher-item" onclick={() => chooseSwitch(r.docId)}>
+                <span class="wl-title">{r.title}</span>
+                <span class="wl-doc">{r.docId}</span>
+              </button>
+            </li>
+          {:else}
+            <li class="switcher-empty">No matching notes</li>
+          {/each}
+        </ul>
+      </div>
+    </div>
   {/if}
 </main>
 
@@ -705,13 +1096,6 @@
   }
   .divider:focus-visible {
     outline: 2px solid #6750a4;
-  }
-  h2 {
-    font-size: 0.9rem;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: #8a8a90;
-    margin: 0 0 0.6rem;
   }
   .block-h {
     font-size: 0.72rem;
@@ -872,6 +1256,205 @@
     border-radius: 999px;
     padding: 0.15rem 0.6rem;
     font-size: 0.76rem;
+  }
+  .modes {
+    display: flex;
+    gap: 0.3rem;
+    margin-bottom: 0.7rem;
+  }
+  .modetab {
+    cursor: pointer;
+    font-size: 0.78rem;
+    border: 1px solid #e0e0e8;
+    background: #fff;
+    color: #6a6a72;
+    border-radius: 7px;
+    padding: 0.25rem 0.7rem;
+  }
+  .modetab.active {
+    background: #efeaf8;
+    color: #6750a4;
+    border-color: #d9cef2;
+    font-weight: 600;
+  }
+  .editor {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .editor-top {
+    display: flex;
+    gap: 0.4rem;
+  }
+  .title-input {
+    flex: 1;
+    min-width: 0;
+    box-sizing: border-box;
+    border: 1px solid #d8d8e0;
+    border-radius: 8px;
+    padding: 0.5rem 0.6rem;
+    font-size: 1rem;
+    font-weight: 600;
+  }
+  .tpl-select {
+    border: 1px solid #d8d8e0;
+    border-radius: 8px;
+    padding: 0 0.4rem;
+    font-size: 0.78rem;
+    color: #6750a4;
+    background: #fff;
+    cursor: pointer;
+  }
+  .body-input {
+    width: 100%;
+    box-sizing: border-box;
+    border: 1px solid #d8d8e0;
+    border-radius: 8px;
+    padding: 0.6rem;
+    resize: vertical;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.86rem;
+    line-height: 1.5;
+  }
+  .editor-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+  .ghost {
+    cursor: pointer;
+    font-size: 0.8rem;
+    background: #f0f0f4;
+    color: #6a6a72;
+    border: 0;
+    border-radius: 8px;
+    padding: 0.5rem 0.8rem;
+  }
+  .editmsg {
+    font-size: 0.76rem;
+    color: #1a7f37;
+  }
+  .editor-hint {
+    margin: 0.2rem 0 0;
+    font-size: 0.74rem;
+    color: #9a9aa2;
+    line-height: 1.4;
+  }
+  .editor-hint code {
+    background: #f2f2f6;
+    border-radius: 4px;
+    padding: 0 4px;
+  }
+  .newnote {
+    background: #efeaf8;
+    color: #6750a4;
+    border: 1px solid #d9cef2;
+  }
+  .back.edit {
+    margin-left: auto;
+    color: #6750a4;
+    background: #efeaf8;
+  }
+  .back.edit + .back {
+    margin-left: 0.4rem;
+  }
+  .body-wrap {
+    position: relative;
+  }
+  .wl-menu {
+    position: absolute;
+    left: 0.6rem;
+    right: 0.6rem;
+    top: 100%;
+    margin: -0.3rem 0 0;
+    padding: 0.2rem;
+    list-style: none;
+    background: #fff;
+    border: 1px solid #d9cef2;
+    border-radius: 8px;
+    box-shadow: 0 6px 20px #0002;
+    z-index: 8;
+    max-height: 220px;
+    overflow: auto;
+  }
+  .wl-item,
+  .switcher-item {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    text-align: left;
+    cursor: pointer;
+    border: 0;
+    background: none;
+    border-radius: 6px;
+    padding: 0.3rem 0.5rem;
+  }
+  .wl-item:hover,
+  .switcher-item:hover {
+    background: #efeaf8;
+  }
+  .wl-title {
+    font-size: 0.84rem;
+    font-weight: 600;
+    color: #2a2a30;
+  }
+  .wl-doc {
+    font-size: 0.7rem;
+    color: #9a9aa2;
+  }
+  .broken-link {
+    color: #b00020;
+    text-decoration: underline dotted;
+  }
+  .links-panel {
+    margin-top: 1rem;
+    border-top: 1px solid #ececf2;
+    padding-top: 0.7rem;
+  }
+  .um-snippet {
+    display: block;
+    font-size: 0.74rem;
+    color: #8a8a90;
+    margin-top: 0.1rem;
+  }
+  .switcher-overlay {
+    position: fixed;
+    inset: 0;
+    background: #0006;
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    padding-top: 12vh;
+    z-index: 20;
+  }
+  .switcher {
+    width: min(560px, 92vw);
+    background: #fff;
+    border-radius: 12px;
+    box-shadow: 0 12px 48px #0004;
+    overflow: hidden;
+  }
+  .switcher-input {
+    width: 100%;
+    box-sizing: border-box;
+    border: 0;
+    border-bottom: 1px solid #ececf2;
+    padding: 0.8rem 1rem;
+    font-size: 1rem;
+    outline: none;
+  }
+  .switcher-list {
+    list-style: none;
+    margin: 0;
+    padding: 0.3rem;
+    max-height: 50vh;
+    overflow: auto;
+  }
+  .switcher-empty {
+    padding: 0.7rem 1rem;
+    color: #9a9aa2;
+    font-size: 0.84rem;
   }
   .popover {
     position: fixed;
