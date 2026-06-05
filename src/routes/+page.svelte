@@ -15,7 +15,13 @@
   import { intake } from '$lib/ingest/intake';
   import { csvToMarkdown } from '$lib/ingest/csv';
   import { buildProxyNote, proxyNotePath } from '$lib/ingest/proxy';
-  import { CHAT_MODELS, formatSize, needsOomAck, modelById } from '$lib/inference/catalog';
+  import {
+    CHAT_MODELS,
+    formatSize,
+    needsOomAck,
+    modelById,
+    recommendModel
+  } from '$lib/inference/catalog';
   import { createNote, updateNote, renameNote, moveNotePath } from '$lib/vault/note-crud';
   import { serializeNote } from '$lib/vault/note';
   import { putSource, allSources, deleteSource } from '$lib/vault/sources-db';
@@ -129,6 +135,8 @@
   let modelCached = $state(false); // weights already on disk → fast load, no download (#4)
   let ackedModels = $state(new Set<string>()); // large models the user already OK'd (FR-CAP-003)
   let gpuBufferLimitGB = $state(0); // WebGPU maxBufferSize cap (Chrome ≈ 2 GB) — gates large models
+  let gpu = $state<{ ok: boolean; vendor: string; arch: string; maxBufferGB: number } | null>(null);
+  let preloading = $state(false); // a background model preload is in flight
 
   // Ingestion UI.
   let importMsg = $state('');
@@ -218,18 +226,26 @@
       }>;
     };
   } | null = null;
-  let loadedModel = '';
+  let loadedModel = $state('');
 
   onMount(async () => {
     coi = crossOriginIsolated;
-    // Detect the WebGPU per-buffer cap (Chrome defaults to ~2 GB). A chat model that needs a single
-    // buffer larger than this CAN'T load — that's a browser/platform limit, not VRAM — so we surface
-    // it in the model warnings rather than letting a big model fail with a cryptic error (ADR-029).
+    // Probe WebGPU once at startup (FR-CAP-001, ADR-030): is chat possible, on what GPU, and what is
+    // the per-buffer cap (Chrome ≈ 2 GB — a single weight buffer above it can't load; this is a
+    // platform limit, not VRAM). Drives the GPU status line + the model recommendation.
     try {
       const adapter = await navigator.gpu?.requestAdapter();
-      if (adapter) gpuBufferLimitGB = adapter.limits.maxBufferSize / 1e9;
+      if (adapter) {
+        gpu = {
+          ok: true,
+          vendor: adapter.info?.vendor || '',
+          arch: adapter.info?.architecture || '',
+          maxBufferGB: adapter.limits.maxBufferSize / 1e9
+        };
+        gpuBufferLimitGB = gpu.maxBufferGB;
+      }
     } catch {
-      /* no WebGPU → chat unsupported anyway */
+      /* no WebGPU → chat unsupported; semantic search still works (FR-CAP-002) */
     }
     const [{ createEmbedClient }, { VectorStore }, { WebLLMProvider }, { EMBEDDING_DIM }] =
       await Promise.all([
@@ -328,6 +344,11 @@
     };
     status = 'ready';
     ready = true;
+
+    // Auto-preload the selected model IF it's already cached (no download) so the first Ask is
+    // instant (ADR-030). We never auto-DOWNLOAD a multi-GB model unasked — uncached models wait for
+    // an explicit Ask / "Preload" click.
+    if (await pipe.provider.isCached(modelId).catch(() => false)) void preloadModel();
   });
 
   const today = (): string => new Date().toISOString().slice(0, 10);
@@ -737,6 +758,75 @@
     showSource(file.docId);
   }
 
+  /**
+   * Ensure `id` is the loaded chat model (FR-CAP-003/004): ack for experimental (7–8 B) models that
+   * may exceed the WebGPU per-buffer cap, cache-aware status, graceful failure. Returns true if it's
+   * loaded (or already current), false if declined/failed. Shared by Ask + preload.
+   */
+  async function ensureModelLoaded(id: string): Promise<boolean> {
+    if (!pipe) return false;
+    if (loadedModel === id) return true;
+    if (needsOomAck(id) && !ackedModels.has(id)) {
+      const m = modelById(id);
+      const limitNote =
+        gpuBufferLimitGB > 0
+          ? `\n\nYour browser's WebGPU limit is ~${gpuBufferLimitGB.toFixed(1)} GB per buffer (a ` +
+            `Chrome cap, not your VRAM). 7–8 B models may need a bigger single buffer and fail to ` +
+            `load; 1–3 B models load reliably.`
+          : '';
+      const ok = confirm(
+        `${m?.label} needs ~${formatSize(m?.sizeMB ?? 0)}.${limitNote}\n\nDownload and try to load it anyway?`
+      );
+      if (!ok) {
+        modelId = loadedModel || DEFAULT_MODEL_ID;
+        status = 'ready';
+        return false;
+      }
+      ackedModels = new Set(ackedModels).add(id);
+    }
+    modelCached = await pipe.provider.isCached(id).catch(() => false);
+    status = `${modelCached ? 'loading cached model' : 'first run — downloading model once'}…`;
+    try {
+      await pipe.provider.loadModel(
+        id,
+        (p) =>
+          (status = `${modelCached ? 'loading' : 'downloading'} model ${(p * 100).toFixed(0)}%`)
+      );
+    } catch (err) {
+      const tooBig = modelById(id);
+      modelId = loadedModel || DEFAULT_MODEL_ID;
+      const cap =
+        gpuBufferLimitGB > 0 ? `~${gpuBufferLimitGB.toFixed(1)} GB WebGPU buffer cap` : 'this GPU';
+      status =
+        `⚠ ${tooBig?.label ?? 'model'} couldn't load — it exceeds ${cap}. ` +
+        `Pick a smaller model. [${err instanceof Error ? err.message : err}]`;
+      return false;
+    }
+    loadedModel = id;
+    modelCached = true;
+    return true;
+  }
+
+  /** Preload the selected model now (so the first Ask is instant). Non-blocking; safe to ignore. */
+  async function preloadModel() {
+    if (!pipe || !ready || busy || preloading || loadedModel === modelId) return;
+    preloading = true;
+    try {
+      const ok = await ensureModelLoaded(modelId);
+      if (ok) status = 'ready';
+    } finally {
+      preloading = false;
+    }
+  }
+
+  /** Switch to the recommended model for this GPU and preload it. */
+  async function useRecommended() {
+    const rec = recommendModel(!!gpu?.ok);
+    if (!rec) return;
+    modelId = rec.id;
+    await preloadModel();
+  }
+
   async function ask() {
     if (!pipe || busy || !query.trim()) return;
     busy = true;
@@ -771,57 +861,11 @@
       }
 
       if (loadedModel !== modelId) {
-        // Large models (≥3 GB VRAM) can exceed a weaker GPU — require an explicit ack once before
-        // committing to the download/load (FR-CAP-003). Decline → fall back to the last loaded model.
-        if (needsOomAck(modelId) && !ackedModels.has(modelId)) {
-          const m = modelById(modelId);
-          const limitNote =
-            gpuBufferLimitGB > 0
-              ? `\n\nYour browser's WebGPU limit is ~${gpuBufferLimitGB.toFixed(1)} GB per buffer ` +
-                `(a Chrome cap, not your VRAM). Models that need a bigger single buffer simply won't ` +
-                `load here — 1–3 B models are the safe choices.`
-              : '';
-          const ok = confirm(
-            `${m?.label} needs ~${formatSize(m?.sizeMB ?? 0)}.` +
-              limitNote +
-              `\n\nDownload and try to load it anyway?`
-          );
-          if (!ok) {
-            modelId = loadedModel || DEFAULT_MODEL_ID;
-            status = 'ready';
-            busy = false;
-            return;
-          }
-          ackedModels = new Set(ackedModels).add(modelId);
-        }
-        // Tell the user whether this is the one-time download or a fast load from cache, so the
-        // wait is never a mystery (the cache check itself is best-effort).
-        modelCached = await pipe.provider.isCached(modelId).catch(() => false);
-        const verb = modelCached ? 'loading cached model' : 'first run — downloading model once';
-        status = `${verb}…`;
-        try {
-          await pipe.provider.loadModel(
-            modelId,
-            (p) =>
-              (status = `${modelCached ? 'loading' : 'downloading'} model ${(p * 100).toFixed(0)}%`)
-          );
-        } catch (err) {
-          // Most likely the WebGPU per-buffer cap (Chrome ≈ 2 GB) or OOM. Recover gracefully: keep
-          // the prior model and point the user at a smaller one rather than a half-loaded engine.
-          const tooBig = modelById(modelId);
-          modelId = loadedModel || DEFAULT_MODEL_ID;
-          const cap =
-            gpuBufferLimitGB > 0
-              ? `~${gpuBufferLimitGB.toFixed(1)} GB WebGPU buffer cap`
-              : 'this GPU';
-          status =
-            `⚠ ${tooBig?.label ?? 'model'} couldn't load — it exceeds ${cap}. ` +
-            `Pick a smaller model (1–3 B). [${err instanceof Error ? err.message : err}]`;
+        const ok = await ensureModelLoaded(modelId);
+        if (!ok) {
           busy = false;
           return;
         }
-        loadedModel = modelId;
-        modelCached = true; // it's in cache now, regardless of where it started
       }
 
       status = 'generating…';
@@ -1155,6 +1199,38 @@
             {/if}
           </select>
         </div>
+
+        {#if ready}
+          {@const rec = recommendModel(!!gpu?.ok)}
+          <div class="gpu-bar" class:warn={!gpu?.ok}>
+            {#if gpu?.ok}
+              <span title="WebGPU per-buffer cap is a Chrome limit, not your VRAM"
+                >🖥 GPU: {gpu.vendor || 'WebGPU'}{gpu.arch ? ` (${gpu.arch})` : ''} · ~{gpu.maxBufferGB.toFixed(
+                  1
+                )} GB/buffer</span
+              >
+              {#if loadedModel === modelId}
+                <span class="ok">✓ model loaded</span>
+              {:else if preloading}
+                <span><span class="spinner" aria-hidden="true"></span> preloading…</span>
+              {:else}
+                <button class="mini" onclick={preloadModel} disabled={busy}>⬇ Preload model</button>
+              {/if}
+              {#if rec && rec.id !== modelId}
+                <button
+                  class="mini accent"
+                  onclick={useRecommended}
+                  disabled={busy}
+                  title="Best quality that loads reliably on this GPU (multilingual)"
+                  >★ Use {rec.label}</button
+                >
+              {/if}
+            {:else}
+              ⚠ No WebGPU — chat unavailable (semantic search still works). Use Chrome/Edge on a
+              GPU-capable device.
+            {/if}
+          </div>
+        {/if}
 
         <textarea bind:value={query} rows="2" placeholder="Ask a question…" disabled={busy}
         ></textarea>
@@ -1967,6 +2043,44 @@
     background: #fff;
     cursor: pointer;
     max-width: 100%;
+  }
+  .gpu-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin-bottom: 0.5rem;
+    font-size: 0.74rem;
+    color: #5a5a64;
+  }
+  .gpu-bar.warn {
+    color: #8a5a00;
+    background: #fff4e0;
+    border-radius: 8px;
+    padding: 0.35rem 0.55rem;
+  }
+  .gpu-bar .ok {
+    color: #1a7f37;
+  }
+  .mini {
+    font: inherit;
+    font-size: 0.72rem;
+    cursor: pointer;
+    border: 1px solid #d8d8e0;
+    background: #fff;
+    border-radius: 6px;
+    padding: 0.12rem 0.5rem;
+    color: #444;
+  }
+  .mini.accent {
+    color: #6750a4;
+    background: #efeaf8;
+    border-color: #d9cffa;
+    font-weight: 600;
+  }
+  .mini:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
   .ask-row {
     display: flex;

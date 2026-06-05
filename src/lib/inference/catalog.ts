@@ -71,8 +71,24 @@ export const CHAT_MODELS: ChatModel[] = [
   }
 ];
 
-/** Models at/above this VRAM footprint require an explicit "this may OOM" ack before load (FR-CAP-003). */
-export const BIG_MODEL_MB = 3000;
+// Models at/above this footprint are flagged "experimental" + need an explicit ack (FR-CAP-003).
+// NOTE: the WebGPU cap is ~2 GB PER BUFFER, not total — WebLLM shards weights into sub-2 GB buffers,
+// so 2.5–3 GB-total models (e.g. Qwen2.5-3B) load fine. Only the larger ones (7–8 B) risk a single
+// buffer exceeding the cap, which is why the gate sits at ~3.5 GB, above the reliable 3 B tier.
+export const BIG_MODEL_MB = 3500;
+
+/** The id we recommend by default — best quality that loads reliably under the WebGPU per-buffer cap. */
+export const RECOMMENDED_MODEL_ID = 'Qwen2.5-3B-Instruct-q4f16_1-MLC';
+
+/**
+ * Recommend the best model for the detected hardware (FR-CAP-001). With WebGPU we suggest the
+ * multilingual 3 B (the quality/reliability sweet spot — loads under the per-buffer cap, strong on
+ * Vietnamese to pair with bge-m3). No WebGPU → null (chat unsupported; semantic search still works).
+ */
+export function recommendModel(webgpu: boolean): ChatModel | null {
+  if (!webgpu) return null;
+  return modelById(RECOMMENDED_MODEL_ID) ?? CHAT_MODELS[0];
+}
 
 export function modelById(id: string): ChatModel | undefined {
   return CHAT_MODELS.find((m) => m.id === id);

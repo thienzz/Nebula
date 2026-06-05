@@ -2,9 +2,11 @@ import { describe, it, expect } from 'vitest';
 import {
   CHAT_MODELS,
   BIG_MODEL_MB,
+  RECOMMENDED_MODEL_ID,
   modelById,
   formatSize,
-  needsOomAck
+  needsOomAck,
+  recommendModel
 } from '../../src/lib/inference/catalog';
 
 // FR-CAP-003/004. The curated chat-model picker + the OOM-risk gate for large models.
@@ -33,6 +35,18 @@ describe('formatSize', () => {
   it('shows GB ≥ 1000 MB, else MB', () => {
     expect(formatSize(945)).toBe('945 MB');
     expect(formatSize(5107)).toBe('5.1 GB');
+  });
+});
+
+describe('recommendModel', () => {
+  it('recommends the multilingual 3B with WebGPU, nothing without', () => {
+    const r = recommendModel(true);
+    expect(r?.id).toBe(RECOMMENDED_MODEL_ID);
+    expect(r?.multilingual).toBe(true);
+    expect(recommendModel(false)).toBeNull();
+  });
+  it('recommends a model that loads reliably (below the experimental ack threshold)', () => {
+    expect(needsOomAck(RECOMMENDED_MODEL_ID)).toBe(false); // a 3B must not be gated as "too big"
   });
 });
 
