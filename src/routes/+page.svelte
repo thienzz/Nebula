@@ -36,6 +36,7 @@
   import { buildFileTree, type TreeNode } from '$lib/nav/tree';
   import { buildTagIndex, notesForTag, coerceTags, extractInlineTags } from '$lib/nav/tags';
   import { scopeDocIds, filterByScope, scopeLabel, type Scope } from '$lib/retrieval/scope';
+  import { dedupeByDoc, referencesFromHits, type SourceRef } from '$lib/retrieval/search';
   import { sourcesFromNotes, sourcesFromHits, parseRedactions } from '$lib/context/sources';
   import { compile } from '$lib/context/compiler';
 
@@ -107,6 +108,7 @@
   let woven = $state<WovenSegment[]>([]);
   let cites = $state<Cite[]>([]);
   let hits = $state<SearchHit[]>([]);
+  let references = $state<SourceRef[]>([]); // distinct source docs behind the answer (FR-CHAT-002)
   let graph = $state<MicroGraph | null>(null);
   let activeDoc = $state<string | null>(null);
   let activeSpan = $state<{ charStart: number; charEnd: number } | null>(null);
@@ -448,6 +450,7 @@
     answer = '';
     woven = [];
     cites = [];
+    references = [];
     graph = null;
     activeDoc = null;
     activeSpan = null;
@@ -457,8 +460,11 @@
       status = scope ? `retrieving (scoped: ${scopeLabel(scope)})…` : 'retrieving…';
       // Scoped retrieval (FR-RET-004): over-fetch then keep only in-scope hits so a question
       // about one client never pulls another client's notes (no cross-client bleed).
-      const raw = await pipe.search(qv, scope ? 24 : 4);
-      hits = filterByScope(raw, scopeIds).slice(0, 4);
+      const raw = filterByScope(await pipe.search(qv, scope ? 24 : 12), scopeIds);
+      // Favor BREADTH across distinct relevant documents (FR-CHAT-002): one best chunk per doc,
+      // up to 5 docs — so the answer synthesizes several notes at once and can reference them all.
+      hits = dedupeByDoc(raw, 5);
+      references = referencesFromHits(hits);
       // Micro-Map (FR-GRAPH-001) + persist the retrieval sub-graph edges (FR-GRAPH-002).
       graph = buildMicroGraph(query, hits);
       try {
@@ -893,11 +899,25 @@
             {:else}
               <p>{answer}</p>
             {/if}
-            {#if cites.length}
-              <div class="cites">
-                cited:
-                {#each cites as c (c.chunkId)}
-                  <button class="chip" onclick={() => jumpTo(c.chunkId)}>[#{c.n}] {c.docId}</button>
+            {#if references.length}
+              <div class="references">
+                <div class="block-h">
+                  References — {references.length} note{references.length > 1 ? 's' : ''}
+                </div>
+                {#each references as r (r.docId)}
+                  {@const cited = cites.some((c) => c.docId === r.docId)}
+                  <button
+                    class="reference"
+                    class:cited
+                    onclick={() => jumpTo(r.chunkId)}
+                    title="Open this note"
+                  >
+                    <span class="ref-n">[{r.n}]</span>
+                    <span class="ref-title"
+                      >{vault.find((n) => n.docId === r.docId)?.title ?? r.docId}</span
+                    >
+                    <span class="ref-doc">{r.docId}</span>
+                  </button>
                 {/each}
               </div>
             {/if}
@@ -1757,23 +1777,45 @@
     font: inherit;
     text-decoration: underline dotted;
   }
-  .cites {
-    margin-top: 0.6rem;
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.35rem;
-    align-items: center;
-    font-size: 0.78rem;
-    color: #8a8a90;
+  .references {
+    margin-top: 0.8rem;
+    border-top: 1px solid #ececf2;
+    padding-top: 0.55rem;
   }
-  .chip {
+  .reference {
+    display: flex;
+    align-items: baseline;
+    gap: 0.4rem;
+    width: 100%;
+    text-align: left;
     cursor: pointer;
-    background: #efeaf8;
-    color: #6750a4;
+    background: none;
     border: 0;
-    border-radius: 999px;
-    padding: 0.15rem 0.6rem;
-    font-size: 0.76rem;
+    border-radius: 6px;
+    padding: 0.25rem 0.4rem;
+  }
+  .reference:hover {
+    background: #efeaf8;
+  }
+  .ref-n {
+    color: #6750a4;
+    font-weight: 600;
+    font-size: 0.8rem;
+  }
+  .reference.cited .ref-n::after {
+    content: ' •';
+    color: #1a7f37;
+  }
+  .ref-title {
+    font-size: 0.82rem;
+    color: #2a2a30;
+    font-weight: 600;
+  }
+  .ref-doc {
+    font-size: 0.72rem;
+    color: #9a9aa2;
+    margin-left: auto;
+    white-space: nowrap;
   }
   .modes {
     display: flex;

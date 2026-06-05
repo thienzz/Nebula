@@ -144,3 +144,34 @@ export function hybridSearch(
     .slice(0, k)
     .map(({ id, score }) => toHit(byId.get(id) as IndexedChunk, score));
 }
+
+/**
+ * Keep the single best (first) hit per document, preserving rank order (FR-RET-001). Used to
+ * favor breadth across DISTINCT relevant documents — so a grounded answer synthesizes from
+ * several notes at once instead of multiple chunks of the same one. `maxDocs` caps the count.
+ */
+export function dedupeByDoc<T extends { docId: string }>(hits: T[], maxDocs = Infinity): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const h of hits) {
+    if (seen.has(h.docId)) continue;
+    seen.add(h.docId);
+    out.push(h);
+    if (out.length >= maxDocs) break;
+  }
+  return out;
+}
+
+export interface SourceRef {
+  n: number; // 1-based reference number, aligned with the inline [#n] citation
+  docId: string;
+  chunkId: string;
+}
+
+/**
+ * The distinct source documents behind an answer, numbered for a "References" list at the foot
+ * of the answer. Numbers line up 1:1 with the inline `[#n]` citation order (FR-CHAT-002/003).
+ */
+export function referencesFromHits(hits: { docId: string; chunkId: string }[]): SourceRef[] {
+  return dedupeByDoc(hits).map((h, i) => ({ n: i + 1, docId: h.docId, chunkId: h.chunkId }));
+}
