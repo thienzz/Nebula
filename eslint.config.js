@@ -44,7 +44,8 @@ export default [
     },
     plugins: { svelte },
     rules: {
-      'no-undef': 'off' // runes ($state, etc.) + DOM are validated by svelte-check
+      'no-undef': 'off', // runes ($state, etc.) + DOM are validated by svelte-check
+      'no-unused-vars': 'off' // type-position param names + real unused vars are caught by svelte-check
     }
   }
 ];

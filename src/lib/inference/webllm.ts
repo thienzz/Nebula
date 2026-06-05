@@ -55,6 +55,9 @@ export class WebLLMProvider implements InferenceProvider {
 
     const stream = await this.engine.chat.completions.create({
       stream: true,
+      // Low temperature → grounded, reproducible answers (RAG should not be creative).
+      temperature: 0.2,
+      top_p: 0.9,
       messages: [
         { role: 'system', content: prompt.system },
         { role: 'user', content: prompt.user }
