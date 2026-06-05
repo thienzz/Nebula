@@ -17,13 +17,14 @@
   import { createNote, updateNote, validateDraft } from '$lib/vault/note-crud';
   import { serializeNote } from '$lib/vault/note';
   import {
-    renderWikilinks,
+    resolveTarget,
     buildBacklinks,
     findUnlinkedMentions,
     autocompleteWikilink,
     applyWikilinkChoice,
     type AutocompleteState
   } from '$lib/weave/wikilink';
+  import { renderMarkdown } from '$lib/render/markdown';
   import { quickSwitch, type SwitchResult } from '$lib/nav/switcher';
   import {
     BUILTIN_TEMPLATES,
@@ -133,6 +134,9 @@
   // File tree + tag pane (FR-NAV-002/003).
   let collapsed = $state(new Set<string>());
   let activeTag = $state<string | null>(null);
+
+  // Live Markdown preview (FR-UI-002 · §5.10).
+  let previewOn = $state(true);
 
   // 40/60 resizable split (FR-UI-001).
   let leftPct = $state(40);
@@ -550,6 +554,18 @@
       : []
   );
 
+  // Markdown preview wiring (FR-UI-002 · §5.10): resolve [[ ]] + delegate wikilink clicks.
+  function resolveNoteLink(target: string) {
+    return resolveTarget(target, titleIndex);
+  }
+  function onRenderedClick(e: MouseEvent) {
+    const a = (e.target as HTMLElement | null)?.closest?.('a.wikilink') as HTMLElement | null;
+    if (a?.dataset.doc) {
+      e.preventDefault();
+      showSource(a.dataset.doc);
+    }
+  }
+
   // --- Wikilink autocomplete (FR-LINK-003) ---------------------------------
   function onBodyInput() {
     if (!bodyEl) return;
@@ -805,11 +821,28 @@
               </ul>
             {/if}
           </div>
+          {#if previewOn && draftBody.trim()}
+            <div class="block-h">Preview</div>
+            <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+            <article
+              class="doc rendered editor-preview"
+              onclick={onRenderedClick}
+              onkeydown={(e) => e.key === 'Enter' && onRenderedClick(e as unknown as MouseEvent)}
+              role="document"
+            >
+              {@html renderMarkdown(draftBody, { resolveLink: resolveNoteLink })}
+            </article>
+          {/if}
           <div class="editor-actions">
             <button class="ask" onclick={saveNote} disabled={!ready || savingNote}>
               {savingNote ? 'Saving…' : editingDocId ? 'Save changes' : 'Save note'}
             </button>
             <button class="ghost" onclick={startNewNote} disabled={savingNote}>＋ New</button>
+            <button
+              class="ghost"
+              onclick={() => (previewOn = !previewOn)}
+              title="Toggle live Markdown preview">👁 {previewOn ? 'Hide' : 'Preview'}</button
+            >
             {#if editMsg}<span class="editmsg">{editMsg}</span>{/if}
           </div>
           <p class="editor-hint">
@@ -879,30 +912,26 @@
             📎 source: {activeNote.sourcePath} — original preserved, never edited
           </div>
         {/if}
-        <article class="doc">
-          {#if activeSpan}
-            {@const seg = buildHighlightSegments(
-              activeNote.text,
-              activeSpan.charStart,
-              activeSpan.charEnd
-            )}
-            {seg.pre}<mark>{seg.hit}</mark>{seg.post}
-          {:else}
-            {#each renderWikilinks(activeNote.text, titleIndex) as seg, i (i)}
-              {@const link = seg.link}
-              {#if link}
-                <button
-                  class="wikilink"
-                  onclick={() => showSource(link.docId)}
-                  onmouseenter={(e) => showPreview(e, link.docId)}
-                  onmouseleave={hidePreview}>{seg.text}</button
-                >
-              {:else if seg.broken}
-                <span class="broken-link" title="No note named this yet">{seg.text}</span>
-              {:else}{seg.text}{/if}
-            {/each}
-          {/if}
-        </article>
+        {#if activeSpan}
+          {@const seg = buildHighlightSegments(
+            activeNote.text,
+            activeSpan.charStart,
+            activeSpan.charEnd
+          )}
+          <article class="doc">{seg.pre}<mark>{seg.hit}</mark>{seg.post}</article>
+        {:else}
+          <!-- Rendered Markdown preview (FR-UI-002). Output is escape-first/safe (ADR-016);
+               wikilink clicks/keys are delegated to vault navigation. -->
+          <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+          <article
+            class="doc rendered"
+            onclick={onRenderedClick}
+            onkeydown={(e) => e.key === 'Enter' && onRenderedClick(e as unknown as MouseEvent)}
+            role="document"
+          >
+            {@html renderMarkdown(activeNote.text, { resolveLink: resolveNoteLink })}
+          </article>
+        {/if}
 
         {#if activeBacklinks.length || activeUnlinked.length}
           <div class="links-panel">
@@ -1224,6 +1253,101 @@
     border-radius: 3px;
     padding: 0 2px;
   }
+  .doc.rendered {
+    white-space: normal;
+  }
+  .doc.rendered :global(h1),
+  .doc.rendered :global(h2),
+  .doc.rendered :global(h3) {
+    line-height: 1.25;
+    margin: 0.8rem 0 0.4rem;
+  }
+  .doc.rendered :global(h1) {
+    font-size: 1.4rem;
+  }
+  .doc.rendered :global(h2) {
+    font-size: 1.2rem;
+  }
+  .doc.rendered :global(h3) {
+    font-size: 1.05rem;
+  }
+  .doc.rendered :global(p) {
+    margin: 0.5rem 0;
+  }
+  .doc.rendered :global(ul),
+  .doc.rendered :global(ol) {
+    margin: 0.4rem 0;
+    padding-left: 1.4rem;
+  }
+  .doc.rendered :global(li) {
+    margin: 0.15rem 0;
+  }
+  .doc.rendered :global(code) {
+    background: #f2f2f6;
+    border-radius: 4px;
+    padding: 0 4px;
+    font-size: 0.86em;
+  }
+  .doc.rendered :global(pre) {
+    background: #1c1c22;
+    color: #f3f3f6;
+    border-radius: 8px;
+    padding: 0.7rem 0.85rem;
+    overflow: auto;
+  }
+  .doc.rendered :global(pre code) {
+    background: none;
+    color: inherit;
+    padding: 0;
+  }
+  .doc.rendered :global(blockquote) {
+    margin: 0.5rem 0;
+    padding: 0.1rem 0.8rem;
+    border-left: 3px solid #d9cef2;
+    color: #5a5a62;
+  }
+  .doc.rendered :global(hr) {
+    border: 0;
+    border-top: 1px solid #e4e4ea;
+    margin: 0.9rem 0;
+  }
+  .doc.rendered :global(table) {
+    border-collapse: collapse;
+    margin: 0.5rem 0;
+    font-size: 0.85rem;
+  }
+  .doc.rendered :global(th),
+  .doc.rendered :global(td) {
+    border: 1px solid #e4e4ea;
+    padding: 0.3rem 0.55rem;
+    text-align: left;
+  }
+  .doc.rendered :global(th) {
+    background: #f6f4fc;
+  }
+  .doc.rendered :global(a.wikilink) {
+    color: #6750a4;
+    text-decoration: underline dotted;
+    cursor: pointer;
+  }
+  .doc.rendered :global(a) {
+    color: #6750a4;
+  }
+  .doc.rendered :global(.broken-link) {
+    color: #b00020;
+    text-decoration: underline dotted;
+  }
+  .doc.rendered :global(input[type='checkbox']) {
+    margin-right: 0.3rem;
+  }
+  .editor-preview {
+    border: 1px solid #ececf2;
+    border-radius: 8px;
+    padding: 0.4rem 0.7rem;
+    background: #fcfcfe;
+    max-height: 40vh;
+    overflow: auto;
+  }
   .controls {
     margin-bottom: 0.5rem;
   }
@@ -1471,10 +1595,6 @@
   .wl-doc {
     font-size: 0.7rem;
     color: #9a9aa2;
-  }
-  .broken-link {
-    color: #b00020;
-    text-decoration: underline dotted;
   }
   .tagbar {
     display: flex;
