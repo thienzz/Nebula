@@ -122,9 +122,10 @@
   let dropActive = $state(false);
   let fileInput: HTMLInputElement;
 
-  // Note editor (FR-NOTE-001/003, FR-UI-002) — the left pane's "Write" mode.
-  let mode = $state<'ask' | 'write'>('ask');
-  let draftTitle = $state('');
+  // Note editor (FR-NOTE-001/003, FR-UI-002). Notes are the PRIMARY action — the app lands in
+  // Write mode with the subject pre-filled; Ask is the secondary tab.
+  let mode = $state<'ask' | 'write'>('write');
+  let draftTitle = $state(new Date().toISOString().slice(0, 10));
   let draftBody = $state('');
   let editingDocId = $state<string | null>(null); // null → creating a new note
   let editMsg = $state('');
@@ -392,9 +393,12 @@
         }
       ];
       editMsg = `✓ saved ${file.docId}`;
+      // Notes are primary: flow straight into a fresh note (date pre-filled), with the folder
+      // tree visible on the right (clear any tag filter / open doc) so navigation isn't lost.
       editingDocId = null;
-      mode = 'ask';
-      // Land back on the folder tree (clear any tag filter / open doc), so navigation isn't lost.
+      draftTitle = today();
+      draftBody = '';
+      mode = 'write';
       activeTag = null;
       activeDoc = null;
       activeSpan = null;
@@ -761,18 +765,18 @@
     <section class="pane chat" style="width: {leftPct}%" aria-label="Chat">
       <div class="modes" role="tablist" aria-label="Left pane mode">
         <button
+          class="modetab primary"
+          class:active={mode === 'write'}
+          role="tab"
+          aria-selected={mode === 'write'}
+          onclick={startNewNote}>✎ New note</button
+        >
+        <button
           class="modetab"
           class:active={mode === 'ask'}
           role="tab"
           aria-selected={mode === 'ask'}
           onclick={() => (mode = 'ask')}>Ask</button
-        >
-        <button
-          class="modetab"
-          class:active={mode === 'write'}
-          role="tab"
-          aria-selected={mode === 'write'}
-          onclick={() => (mode = 'write')}>✎ Write</button
         >
       </div>
 
@@ -1836,6 +1840,16 @@
     color: #6750a4;
     border-color: #d9cef2;
     font-weight: 600;
+  }
+  .modetab.primary {
+    border-color: #d9cef2;
+    color: #6750a4;
+    font-weight: 600;
+  }
+  .modetab.primary.active {
+    background: #6750a4;
+    color: #fff;
+    border-color: #6750a4;
   }
   .editor {
     display: flex;
