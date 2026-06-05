@@ -17,6 +17,7 @@
     "format": "prettier --write .",
     "test:unit": "vitest run --config vitest.config.ts",
     "test:int": "vitest run --config vitest.integration.config.ts",
+    "test:models": "vitest run --config vitest.models.config.ts",
     "test:e2e": "playwright test",
     "bench": "node tests/bench/run.mjs"
   },

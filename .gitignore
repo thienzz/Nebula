@@ -8,7 +8,8 @@ build/
 dist/
 
 # model weights cache (large, downloaded at runtime — NEVER commit)
-models/
+/models/
+.models-cache/
 *.bin
 *.onnx
 *.wasm.cache
