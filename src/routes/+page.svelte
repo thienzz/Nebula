@@ -142,6 +142,15 @@
   let editingDocId = $state<string | null>(null); // null → creating a new note
   let editMsg = $state('');
   let savingNote = $state(false);
+
+  // BACKGROUND indexing queue (ADR-024, the Obsidian model): saving a note is INSTANT — the note
+  // lands in the vault and the editor frees immediately; embedding happens here, off the save path,
+  // so a long note never locks the editor. The note is searchable once its job drains.
+  type IndexJob = { docId: string; body: string; oldDocId?: string };
+  let indexJobs: IndexJob[] = [];
+  let indexRunning = false;
+  let bgPending = $state(0); // notes waiting/being indexed (drives the unobtrusive header indicator)
+  let bgProgress = $state(''); // e.g. "apollo 32/66" for the current job
   let bodyEl = $state<HTMLTextAreaElement>();
   let wlState = $state<AutocompleteState | null>(null); // wikilink autocomplete (FR-LINK-003)
 
@@ -364,6 +373,36 @@
     mode = 'write';
   }
 
+  const shortName = (docId: string) => docId.slice(docId.lastIndexOf('/') + 1).replace(/\.md$/, '');
+
+  /** Queue a note for background indexing (drop old chunks first on an edit/rename, then embed). */
+  function enqueueIndex(docId: string, body: string, oldDocId?: string) {
+    indexJobs.push({ docId, body, oldDocId });
+    bgPending = indexJobs.length;
+    void drainIndexQueue();
+  }
+
+  /** Serially drain the index queue off the save path; the worker does the heavy work (ADR-023/024). */
+  async function drainIndexQueue() {
+    if (indexRunning || !pipe) return;
+    indexRunning = true;
+    while (indexJobs.length) {
+      const job = indexJobs[0];
+      try {
+        if (job.oldDocId) await pipe.removeDoc(job.oldDocId);
+        await pipe.ingest(job.docId, job.body, (done, total) => {
+          bgProgress = total > EMBED_PROGRESS_MIN ? `${shortName(job.docId)} ${done}/${total}` : '';
+        });
+      } catch {
+        /* a failed index shouldn't wedge the queue; the note stays in the vault, just unindexed */
+      }
+      indexJobs.shift();
+      bgPending = indexJobs.length;
+      bgProgress = '';
+    }
+    indexRunning = false;
+  }
+
   async function saveNote() {
     if (!pipe || !ready || savingNote) return;
     // Never block a save on a missing subject — default it to today's date. Duplicates are
@@ -373,6 +412,8 @@
     editMsg = 'saving…';
     try {
       const nowIso = new Date().toISOString();
+      const body = draftBody;
+      const oldDocId = editingDocId ?? undefined;
       let file;
       if (editingDocId) {
         const existing = vault.find((n) => n.docId === editingDocId);
@@ -384,23 +425,21 @@
           docId: editingDocId,
           markdown: currentMd,
           title: draftTitle,
-          body: draftBody,
+          body,
           now: nowIso
         });
-        await pipe.removeDoc(editingDocId); // drop stale chunks before re-indexing the new body
       } else {
         file = await createNote({
           title: draftTitle,
-          body: draftBody,
+          body,
           now: nowIso,
           folder: draftFolder,
           existingPaths: vault.map((n) => n.docId)
         });
       }
-      // Index with progress so a long note shows "indexing 32/63…" instead of a frozen UI.
-      await pipe.ingest(file.docId, draftBody, (done, total) => {
-        editMsg = total > EMBED_PROGRESS_MIN ? `indexing ${done}/${total} chunks…` : 'saving…';
-      });
+      // INSTANT save (the Obsidian model, ADR-024): the note is in the vault NOW — visible,
+      // linkable, editable — and the editor frees immediately. Embedding runs in the BACKGROUND
+      // queue, so a long note never locks the editor; it becomes searchable when its job drains.
       const title = String(file.note.frontmatter.title ?? draftTitle);
       vault = [
         ...vault.filter((n) => n.docId !== file.docId && n.docId !== editingDocId),
@@ -408,11 +447,12 @@
           docId: file.docId,
           title,
           aliases: [],
-          text: draftBody,
+          text: body,
           kind: 'note',
           frontmatter: file.note.frontmatter
         }
       ];
+      enqueueIndex(file.docId, body, oldDocId);
       editMsg = `✓ saved ${file.docId}`;
       // Notes are primary: flow straight into a fresh note (date pre-filled), with the folder
       // tree visible on the right (clear any tag filter / open doc) so navigation isn't lost.
@@ -430,11 +470,9 @@
     }
   }
 
-  /** Re-key a note's chunks in the index from `oldDocId` → `newDocId` (drop stale, re-embed). */
-  async function reindexAs(oldDocId: string, newDocId: string, body: string) {
-    if (!pipe) return;
-    await pipe.removeDoc(oldDocId);
-    await pipe.ingest(newDocId, body);
+  /** Re-key a note's chunks from `oldDocId` → `newDocId` via the background queue (non-blocking). */
+  function reindexAs(oldDocId: string, newDocId: string, body: string) {
+    enqueueIndex(newDocId, body, oldDocId);
   }
 
   // Delete a note (FR-NOTE-009): remove it from the vault + drop its chunks from the index. Works
@@ -479,7 +517,7 @@
       existingPaths: vault.map((n) => n.docId)
     });
     const newTitleStr = String(file.note.frontmatter.title);
-    await reindexAs(note.docId, file.docId, note.text);
+    reindexAs(note.docId, file.docId, note.text);
 
     // Rewrite inbound [[oldTitle]] links across every other note; re-index the ones that changed.
     const rewrites = new Map<string, string>();
@@ -488,7 +526,7 @@
       const r = rewriteWikilinkTitle(other.text, oldTitle, newTitleStr);
       if (r.changed) rewrites.set(other.docId, r.text);
     }
-    for (const [docId, body] of rewrites) await reindexAs(docId, docId, body);
+    for (const [docId, body] of rewrites) reindexAs(docId, docId, body);
 
     vault = vault
       .filter((n) => n.docId !== note.docId)
@@ -511,7 +549,7 @@
 
   // Move a note to another folder (FR-NOTE-008): the filename (slug) and title are unchanged, so
   // title-based wikilinks keep resolving — only the docId/path changes, re-keyed in the index.
-  async function moveNoteAction(note: Note) {
+  function moveNoteAction(note: Note) {
     if (!pipe || !ready) return;
     const currentFolder = note.docId.slice(0, note.docId.lastIndexOf('/')) || 'notes';
     const next = prompt('Move note — destination folder:', currentFolder);
@@ -522,7 +560,7 @@
       vault.map((n) => n.docId)
     );
     if (newDocId === note.docId) return;
-    await reindexAs(note.docId, newDocId, note.text);
+    reindexAs(note.docId, newDocId, note.text);
     vault = vault.filter((n) => n.docId !== note.docId).concat([{ ...note, docId: newDocId }]);
     if (activeDoc === note.docId) activeDoc = newDocId;
     if (editingDocId === note.docId) editingDocId = newDocId;
@@ -910,6 +948,12 @@
     >
       ⤓ Export Vault
     </button>
+    {#if bgPending > 0}
+      <span class="bg-index" title="Notes are saved instantly; embedding runs in the background.">
+        <span class="spinner" aria-hidden="true"></span>
+        indexing{bgProgress ? ` ${bgProgress}` : ''}{bgPending > 1 ? ` · ${bgPending} queued` : ''}
+      </span>
+    {/if}
     <span class="status">
       {#if busy || !ready}<span class="spinner" aria-hidden="true"></span>{/if}
       {status}{ready && ttft ? ` · TTFT ${ttft}ms · ${tps} tok/s` : ''}
@@ -1498,6 +1542,20 @@
     border: 1px solid #d9cef2;
     border-radius: 7px;
     padding: 0.2rem 0.55rem;
+  }
+  .bg-index {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.74rem;
+    color: #6750a4;
+    background: #efeaf8;
+    border-radius: 6px;
+    padding: 1px 8px;
+  }
+  .bg-index + .status {
+    margin-left: 0.5rem;
   }
   .status {
     margin-left: auto;
