@@ -14,6 +14,7 @@
   import { intake } from '$lib/ingest/intake';
   import { csvToMarkdown } from '$lib/ingest/csv';
   import { buildProxyNote, proxyNotePath } from '$lib/ingest/proxy';
+  import { CHAT_MODELS, formatSize, needsOomAck, modelById } from '$lib/inference/catalog';
   import { createNote, updateNote, renameNote, moveNotePath } from '$lib/vault/note-crud';
   import { serializeNote } from '$lib/vault/note';
   import {
@@ -84,11 +85,7 @@
     }
   ];
 
-  const MODELS = [
-    { id: 'Llama-3.2-1B-Instruct-q4f16_1-MLC', label: 'Llama-3.2-1B (fast)' },
-    { id: 'Phi-3-mini-4k-instruct-q4f16_1-MLC', label: 'Phi-3-mini (default)' },
-    { id: 'Qwen2.5-0.5B-Instruct-q4f16_1-MLC', label: 'Qwen2.5-0.5B (tiny)' }
-  ];
+  const MODELS = CHAT_MODELS; // curated tiny→large picker with VRAM labels + OOM guard (catalog.ts)
 
   let vault = $state<Note[]>(SEED.map((n) => ({ ...n })));
   let originals = $state<{ path: string; bytes: Uint8Array }[]>([]);
@@ -108,7 +105,12 @@
 
   let status = $state('starting…');
   let ready = $state(false);
-  let modelId = $state(MODELS[0].id);
+  // Default to the fast 1B (good speed/quality for first load); larger, more accurate models are
+  // one pick away in the catalog. `?? MODELS[0]` keeps it safe if the id is ever pruned.
+  const DEFAULT_MODEL_ID = (
+    MODELS.find((m) => m.id === 'Llama-3.2-1B-Instruct-q4f16_1-MLC') ?? MODELS[0]
+  ).id;
+  let modelId = $state(DEFAULT_MODEL_ID);
   let query = $state('Does Nebula upload my notes to a server?');
   let answer = $state('');
   let woven = $state<WovenSegment[]>([]);
@@ -123,6 +125,7 @@
   let tps = $state(0);
   let coi = $state(false);
   let modelCached = $state(false); // weights already on disk → fast load, no download (#4)
+  let ackedModels = $state(new Set<string>()); // large models the user already OK'd (FR-CAP-003)
 
   // Ingestion UI.
   let importMsg = $state('');
@@ -218,7 +221,8 @@
     const countTokens = await makeBgeTokenCounter();
     const store = new VectorStore();
     try {
-      await store.connect('indxdb://nebula-app', EMBEDDING_DIM);
+      // -m3 namespace: the 1024-dim bge-m3 index must not collide with an old 384-dim store (ADR-021).
+      await store.connect('indxdb://nebula-app-m3', EMBEDDING_DIM);
     } catch {
       await store.connect('mem://', EMBEDDING_DIM);
     }
@@ -591,16 +595,43 @@
       }
 
       if (loadedModel !== modelId) {
+        // Large models (≥3 GB VRAM) can exceed a weaker GPU — require an explicit ack once before
+        // committing to the download/load (FR-CAP-003). Decline → fall back to the last loaded model.
+        if (needsOomAck(modelId) && !ackedModels.has(modelId)) {
+          const m = modelById(modelId);
+          const ok = confirm(
+            `${m?.label} needs ~${formatSize(m?.sizeMB ?? 0)} of GPU memory.\n` +
+              `On a GPU with less VRAM it may fail to load or run slowly.\nDownload and load it anyway?`
+          );
+          if (!ok) {
+            modelId = loadedModel || DEFAULT_MODEL_ID;
+            status = 'ready';
+            busy = false;
+            return;
+          }
+          ackedModels = new Set(ackedModels).add(modelId);
+        }
         // Tell the user whether this is the one-time download or a fast load from cache, so the
         // wait is never a mystery (the cache check itself is best-effort).
         modelCached = await pipe.provider.isCached(modelId).catch(() => false);
         const verb = modelCached ? 'loading cached model' : 'first run — downloading model once';
         status = `${verb}…`;
-        await pipe.provider.loadModel(
-          modelId,
-          (p) =>
-            (status = `${modelCached ? 'loading' : 'downloading'} model ${(p * 100).toFixed(0)}%`)
-        );
+        try {
+          await pipe.provider.loadModel(
+            modelId,
+            (p) =>
+              (status = `${modelCached ? 'loading' : 'downloading'} model ${(p * 100).toFixed(0)}%`)
+          );
+        } catch (err) {
+          // Most likely OOM / adapter buffer limit on this GPU. Recover gracefully: keep the prior
+          // model, tell the user to pick a smaller one rather than leaving a half-loaded engine.
+          modelId = loadedModel || DEFAULT_MODEL_ID;
+          status =
+            `⚠ ${modelById(modelId)?.label ?? 'model'} couldn't load on this GPU ` +
+            `(likely out of memory) — try a smaller model. [${err instanceof Error ? err.message : err}]`;
+          busy = false;
+          return;
+        }
         loadedModel = modelId;
         modelCached = true; // it's in cache now, regardless of where it started
       }
@@ -902,7 +933,9 @@
       {#if mode === 'ask'}
         <div class="controls">
           <select bind:value={modelId} disabled={busy}>
-            {#each MODELS as m (m.id)}<option value={m.id}>{m.label}</option>{/each}
+            {#each MODELS as m (m.id)}<option value={m.id}
+                >{m.label} · {formatSize(m.sizeMB)}</option
+              >{/each}
           </select>
           <select
             class="scope-select"

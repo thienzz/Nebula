@@ -1,0 +1,90 @@
+// Chat-model catalog (FR-CAP-003/004, ADR-022) — the curated subset of WebLLM's prebuilt models the picker
+// offers, from tiny/fast to large/accurate. `sizeMB` is WebLLM's `vram_required_MB` for the
+// q4f16_1 build (the in-VRAM footprint ≈ the one-time download), used to label each option and to
+// gate the large ones behind an explicit OOM-risk acknowledgment. Pure data + helpers — no GPU, so
+// the picker logic is unit-testable. All ids are verified present in `prebuiltAppConfig.model_list`.
+
+export interface ChatModel {
+  id: string; // WebLLM model_id
+  label: string; // picker label
+  params: string; // parameter count, e.g. "3B"
+  sizeMB: number; // VRAM/download footprint (WebLLM vram_required_MB, q4f16_1)
+  multilingual?: boolean; // notably strong on non-English (incl. Vietnamese)
+}
+
+// Ordered by parameter count (a speed↔accuracy ladder). Note `sizeMB` is NOT monotonic with params
+// — e.g. Qwen2.5-0.5B's vocab makes it heavier than Llama-3.2-1B — so the picker shows each size.
+export const CHAT_MODELS: ChatModel[] = [
+  {
+    id: 'Qwen2.5-0.5B-Instruct-q4f16_1-MLC',
+    label: 'Qwen2.5-0.5B (tiny)',
+    params: '0.5B',
+    sizeMB: 945,
+    multilingual: true
+  },
+  {
+    id: 'Llama-3.2-1B-Instruct-q4f16_1-MLC',
+    label: 'Llama-3.2-1B (fast)',
+    params: '1B',
+    sizeMB: 879
+  },
+  {
+    id: 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC',
+    label: 'Qwen2.5-1.5B',
+    params: '1.5B',
+    sizeMB: 1630,
+    multilingual: true
+  },
+  { id: 'gemma-2-2b-it-q4f16_1-MLC', label: 'Gemma-2-2B', params: '2B', sizeMB: 1895 },
+  {
+    id: 'Llama-3.2-3B-Instruct-q4f16_1-MLC',
+    label: 'Llama-3.2-3B (balanced)',
+    params: '3B',
+    sizeMB: 2264
+  },
+  {
+    id: 'Qwen2.5-3B-Instruct-q4f16_1-MLC',
+    label: 'Qwen2.5-3B (multilingual)',
+    params: '3B',
+    sizeMB: 2505,
+    multilingual: true
+  },
+  { id: 'Phi-3-mini-4k-instruct-q4f16_1-MLC', label: 'Phi-3-mini', params: '3.8B', sizeMB: 3672 },
+  {
+    id: 'Mistral-7B-Instruct-v0.3-q4f16_1-MLC',
+    label: 'Mistral-7B (accurate)',
+    params: '7B',
+    sizeMB: 4573
+  },
+  {
+    id: 'Llama-3.1-8B-Instruct-q4f16_1-MLC',
+    label: 'Llama-3.1-8B (accurate)',
+    params: '8B',
+    sizeMB: 5001
+  },
+  {
+    id: 'Qwen2.5-7B-Instruct-q4f16_1-MLC',
+    label: 'Qwen2.5-7B (multilingual, accurate)',
+    params: '7B',
+    sizeMB: 5107,
+    multilingual: true
+  }
+];
+
+/** Models at/above this VRAM footprint require an explicit "this may OOM" ack before load (FR-CAP-003). */
+export const BIG_MODEL_MB = 3000;
+
+export function modelById(id: string): ChatModel | undefined {
+  return CHAT_MODELS.find((m) => m.id === id);
+}
+
+/** Human-readable size: GB for ≥1000 MB, else MB. */
+export function formatSize(mb: number): string {
+  return mb >= 1000 ? `${(mb / 1000).toFixed(1)} GB` : `${mb} MB`;
+}
+
+/** True if this model is large enough to warrant the OOM-risk acknowledgment (FR-CAP-003). */
+export function needsOomAck(modelId: string): boolean {
+  const m = modelById(modelId);
+  return !!m && m.sizeMB >= BIG_MODEL_MB;
+}

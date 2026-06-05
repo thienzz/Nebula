@@ -50,7 +50,7 @@ describe('TC-SET-001 — persistence across restart', () => {
   it('rejects an out-of-window chunkTargetSize with a clear reason', async () => {
     const io = memoryIO();
     const current = await loadSettings(io);
-    const { settings, errors } = updateSettings(current, { chunkTargetSize: 1000 });
+    const { settings, errors } = updateSettings(current, { chunkTargetSize: 9000 }); // > bge-m3 window
     expect(errors.some((e) => /embedding window/.test(e))).toBe(true);
     expect(settings.chunkTargetSize).toBe(current.chunkTargetSize); // unchanged
   });

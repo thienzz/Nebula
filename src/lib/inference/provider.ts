@@ -47,6 +47,11 @@ export interface InferenceProvider {
 // Phase 1 default model IDs (DEPENDENCIES.lock §3 — confirm against webllm.prebuiltAppConfig).
 export const DEFAULT_CHAT_MODEL = 'Phi-3-mini-4k-instruct-q4f16_1-MLC';
 export const OPTIONAL_CHAT_MODEL = 'Llama-3-8B-Instruct-q4f16_1-MLC';
-export const EMBEDDING_MODEL = 'Xenova/bge-small-en-v1.5'; // 384-dim, 512-token (ADR-006)
-export const EMBEDDING_DIM = 384;
-export const EMBEDDING_MAX_TOKENS = 512;
+// Multilingual embedder (ADR-021): `bge-m3` (XLM-RoBERTa) embeds 100+ languages — incl. Vietnamese
+// — into a shared space, so retrieval works on non-English notes where the old English-only
+// `bge-small-en` scored poorly. Dense vectors are 1024-dim, CLS-pooled + L2-normalized. Quantized
+// (q8) so the in-browser download stays reasonable. Everything reads EMBEDDING_DIM, so the swap is
+// the three constants below + the store namespace bump.
+export const EMBEDDING_MODEL = 'Xenova/bge-m3';
+export const EMBEDDING_DIM = 1024;
+export const EMBEDDING_MAX_TOKENS = 8192; // bge-m3 context (chunks stay far under this)

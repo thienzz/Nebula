@@ -1,7 +1,8 @@
-// Real embedder — `bge-small-en-v1.5` via @huggingface/transformers (FR-ING-004,
-// ALGORITHMS §2). Produces 384-dim, L2-normalized float vectors. Runs on the ONNX
-// runtime: WebGPU when available, else WASM/CPU — which is why semantic search still
-// works on the degraded tier (FR-CAP-002) and headless in Node (no GPU required).
+// Real embedder — `bge-m3` (multilingual, ADR-021) via @huggingface/transformers (FR-ING-004,
+// ALGORITHMS §2). Produces 1024-dim, CLS-pooled, L2-normalized float vectors. Runs on the ONNX
+// runtime: WebGPU when available, else WASM/CPU — which is why semantic search still works on the
+// degraded tier (FR-CAP-002) and headless in Node (no GPU required). The model is downloaded q8-
+// quantized to keep the in-browser fetch reasonable.
 //
 // In the app this runs in a Worker (NFR-PERF-004); the logic is identical in Node tests.
 
@@ -18,20 +19,19 @@ let extractorPromise: Promise<FeatureExtractionPipeline> | null = null;
 let tokenizerPromise: Promise<PreTrainedTokenizer> | null = null;
 
 export function getEmbedder(): Promise<FeatureExtractionPipeline> {
-  return (extractorPromise ??= pipeline(
-    'feature-extraction',
-    EMBEDDING_MODEL
-  ) as unknown as Promise<FeatureExtractionPipeline>);
+  return (extractorPromise ??= pipeline('feature-extraction', EMBEDDING_MODEL, {
+    dtype: 'q8'
+  }) as unknown as Promise<FeatureExtractionPipeline>);
 }
 
 export function getTokenizer(): Promise<PreTrainedTokenizer> {
   return (tokenizerPromise ??= AutoTokenizer.from_pretrained(EMBEDDING_MODEL));
 }
 
-/** Embed a single string → 384-dim normalized vector. */
+/** Embed a single string → 1024-dim CLS-pooled, normalized vector (bge-m3). */
 export async function embed(text: string): Promise<number[]> {
   const extractor = await getEmbedder();
-  const out = await extractor(text, { pooling: 'mean', normalize: true });
+  const out = await extractor(text, { pooling: 'cls', normalize: true });
   const vec = Array.from(out.data as Float32Array);
   if (vec.length !== EMBEDDING_DIM) {
     throw new Error(`Embedding dim mismatch: expected ${EMBEDDING_DIM}, got ${vec.length}`);
@@ -43,7 +43,7 @@ export async function embed(text: string): Promise<number[]> {
 export async function embedBatch(texts: string[]): Promise<number[][]> {
   if (texts.length === 0) return [];
   const extractor = await getEmbedder();
-  const out = await extractor(texts, { pooling: 'mean', normalize: true });
+  const out = await extractor(texts, { pooling: 'cls', normalize: true });
   const dims = out.dims;
   const dim = dims[dims.length - 1];
   const data = out.data as Float32Array;
