@@ -32,6 +32,8 @@
     dailyNotePath,
     dailyNoteBody
   } from '$lib/vault/template';
+  import { buildFileTree, type TreeNode } from '$lib/nav/tree';
+  import { buildTagIndex, notesForTag, coerceTags, extractInlineTags } from '$lib/nav/tags';
 
   type Note = {
     docId: string;
@@ -127,6 +129,10 @@
   // Quick switcher (FR-NAV-001).
   let switcherOpen = $state(false);
   let switcherQuery = $state('');
+
+  // File tree + tag pane (FR-NAV-002/003).
+  let collapsed = $state(new Set<string>());
+  let activeTag = $state<string | null>(null);
 
   // 40/60 resizable split (FR-UI-001).
   let leftPct = $state(40);
@@ -585,6 +591,29 @@
     switcherOpen = false;
     showSource(docId);
   }
+
+  // --- File tree + tag pane (FR-NAV-002/003) -------------------------------
+  const fileTree = $derived<TreeNode[]>(buildFileTree(vault.map((n) => n.docId)));
+  const taggedVault = $derived(
+    vault.map((n) => ({
+      docId: n.docId,
+      tags: [...coerceTags(n.frontmatter?.tags), ...extractInlineTags(n.text)]
+    }))
+  );
+  const tagIndex = $derived(buildTagIndex(taggedVault));
+  const taggedDocIds = $derived(activeTag ? new Set(notesForTag(taggedVault, activeTag)) : null);
+  const filteredNotes = $derived(
+    taggedDocIds ? vault.filter((n) => taggedDocIds.has(n.docId)) : []
+  );
+  function toggleFolder(path: string) {
+    const next = new Set(collapsed);
+    if (next.has(path)) next.delete(path);
+    else next.add(path);
+    collapsed = next;
+  }
+  function toggleTag(tag: string) {
+    activeTag = activeTag === tag ? null : tag;
+  }
   function onGlobalKey(e: KeyboardEvent) {
     if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'o')) {
       e.preventDefault();
@@ -898,19 +927,59 @@
           </div>
         {/if}
       {:else}
-        <div class="block-h">Vault — {vault.length} notes</div>
-        {#each vault as note (note.docId)}
-          <button class="note" onclick={() => showSource(note.docId)}>
-            <div class="note-title">
-              {note.docId}
-              {#if note.kind}<span class="badge">{note.kind}</span>{/if}
-            </div>
-            <div class="note-body">{note.text}</div>
-          </button>
-        {/each}
+        {#if tagIndex.length}
+          <div class="block-h">🏷 Tags</div>
+          <div class="tagbar">
+            {#each tagIndex as t (t.tag)}
+              <button
+                class="tagchip"
+                class:active={activeTag === t.tag}
+                onclick={() => toggleTag(t.tag)}
+                >#{t.tag} <span class="tagcount">{t.count}</span></button
+              >
+            {/each}
+          </div>
+        {/if}
+
+        {#if activeTag}
+          <div class="block-h">
+            Tagged #{activeTag} — {filteredNotes.length}
+            <button class="back" onclick={() => (activeTag = null)}>✕ clear</button>
+          </div>
+          {#each filteredNotes as note (note.docId)}
+            <button class="note" onclick={() => showSource(note.docId)}>
+              <div class="note-title">
+                {note.docId}
+                {#if note.kind}<span class="badge">{note.kind}</span>{/if}
+              </div>
+              <div class="note-body">{note.text}</div>
+            </button>
+          {/each}
+        {:else}
+          <div class="block-h">📁 Vault — {vault.length} notes</div>
+          {@render treeView(fileTree)}
+        {/if}
       {/if}
     </section>
   </div>
+
+  {#snippet treeView(nodes: TreeNode[])}
+    {#each nodes as node (node.path)}
+      {#if node.kind === 'folder'}
+        <button class="tree-folder" onclick={() => toggleFolder(node.path)}>
+          <span class="tree-caret">{collapsed.has(node.path) ? '▸' : '▾'}</span>📁 {node.name}
+        </button>
+        {#if !collapsed.has(node.path)}
+          <div class="tree-children">{@render treeView(node.children)}</div>
+        {/if}
+      {:else}
+        {@const kind = vault.find((n) => n.docId === node.docId)?.kind}
+        <button class="tree-file" onclick={() => node.docId && showSource(node.docId)}>
+          📄 {node.name}{#if kind}<span class="badge">{kind}</span>{/if}
+        </button>
+      {/if}
+    {/each}
+  {/snippet}
 
   {#if preview}
     <div class="popover" style="left: {preview.x}px; top: {preview.y}px">{preview.text}</div>
@@ -1406,6 +1475,60 @@
   .broken-link {
     color: #b00020;
     text-decoration: underline dotted;
+  }
+  .tagbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+    margin-bottom: 0.9rem;
+  }
+  .tagchip {
+    cursor: pointer;
+    font-size: 0.74rem;
+    background: #f3f1fa;
+    color: #6750a4;
+    border: 1px solid #e7e0f8;
+    border-radius: 999px;
+    padding: 0.1rem 0.55rem;
+  }
+  .tagchip.active {
+    background: #6750a4;
+    color: #fff;
+    border-color: #6750a4;
+  }
+  .tagcount {
+    opacity: 0.6;
+    font-size: 0.68rem;
+  }
+  .tree-folder,
+  .tree-file {
+    display: block;
+    width: 100%;
+    text-align: left;
+    cursor: pointer;
+    border: 0;
+    background: none;
+    border-radius: 6px;
+    padding: 0.22rem 0.4rem;
+    font-size: 0.82rem;
+    color: #2a2a30;
+  }
+  .tree-folder {
+    font-weight: 600;
+  }
+  .tree-folder:hover,
+  .tree-file:hover {
+    background: #efeaf8;
+  }
+  .tree-caret {
+    display: inline-block;
+    width: 0.9rem;
+    color: #9a9aa2;
+  }
+  .tree-children {
+    margin-left: 0.8rem;
+    border-left: 1px solid #ececf2;
+    padding-left: 0.3rem;
   }
   .links-panel {
     margin-top: 1rem;
