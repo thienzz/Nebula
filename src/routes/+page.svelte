@@ -1,21 +1,32 @@
 <script lang="ts">
-  // Nebula workspace — the "Obsidian DNA" surfaces wired onto the REAL RAG pipeline:
-  // chunk → bge embed → SurrealDB HNSW (indxdb) → cosine retrieve → WebLLM grounded answer.
-  // 40/60 resizable split (FR-UI-001); right-pane document viewer with Magic Jump scroll +
-  // yellow highlight of the cited span (FR-CHAT-003); the Weaver auto-wikilinks the answer
-  // with hover popovers (FR-LINK-001/002); the Micro-Map renders the retrieval sub-graph
-  // (FR-GRAPH-001/002); Export Vault downloads a portable .zip (FR-DATA-006). Runs in-browser.
+  // Nebula workspace — the "Obsidian DNA" surfaces on the REAL RAG pipeline, now with
+  // multi-format ingestion: drop PDF/CSV/TXT/MD → intake → Markdown Proxy Note (source
+  // backlink, original untouched) → chunk → bge embed → SurrealDB HNSW (indxdb) → retrieve
+  // → WebLLM grounded answer. 40/60 resizable split (FR-UI-001); Magic Jump scroll+highlight
+  // (FR-CHAT-003); the Weaver auto-wikilinks (FR-LINK-001/002); Micro-Map (FR-GRAPH-001/002);
+  // Export Vault → .zip of .md proxies + original binaries under sources/ (FR-DATA-006). In-browser.
   import { onMount, tick } from 'svelte';
   import type { SearchHit } from '$lib/inference/provider';
   import { buildTitleIndex, weaveLinks, notePreview, type WovenSegment } from '$lib/weave/weaver';
   import { buildMicroGraph, type MicroGraph } from '$lib/graph/micrograph';
   import { resolveCitationTarget, buildHighlightSegments } from '$lib/chat/citation';
   import { exportVaultZip } from '$lib/vault/export';
+  import { intake } from '$lib/ingest/intake';
+  import { csvToMarkdown } from '$lib/ingest/csv';
+  import { buildProxyNote, proxyNotePath } from '$lib/ingest/proxy';
 
-  type Note = { docId: string; title: string; aliases: string[]; text: string };
+  type Note = {
+    docId: string;
+    title: string;
+    aliases: string[];
+    text: string;
+    kind?: string; // 'pdf' | 'csv' | 'txt' | 'md' for imports; undefined for seed
+    sourcePath?: string; // backlink to the untouched original
+    frontmatter?: Record<string, unknown>;
+  };
   type Cite = { n: number; chunkId: string; docId: string };
 
-  const VAULT: Note[] = [
+  const SEED: Note[] = [
     {
       docId: 'notes/apollo.md',
       title: 'Apollo',
@@ -48,14 +59,15 @@
     { id: 'Qwen2.5-0.5B-Instruct-q4f16_1-MLC', label: 'Qwen2.5-0.5B (tiny)' }
   ];
 
-  // The Weaver's title index (FR-LINK-001), built once from the vault note titles + aliases.
-  const noteRefs = VAULT.map((n) => ({
-    docId: n.docId,
-    title: n.title,
-    aliases: n.aliases,
-    summary: n.text
-  }));
-  const titleIndex = buildTitleIndex(noteRefs);
+  let vault = $state<Note[]>(SEED.map((n) => ({ ...n })));
+  let originals = $state<{ path: string; bytes: Uint8Array }[]>([]);
+
+  // The Weaver's title index (FR-LINK-001) — rebuilds as the vault grows.
+  const titleIndex = $derived(
+    buildTitleIndex(
+      vault.map((n) => ({ docId: n.docId, title: n.title, aliases: n.aliases, summary: n.text }))
+    )
+  );
 
   let status = $state('starting…');
   let ready = $state(false);
@@ -73,6 +85,11 @@
   let tps = $state(0);
   let coi = $state(false);
 
+  // Ingestion UI.
+  let importMsg = $state('');
+  let dropActive = $state(false);
+  let fileInput: HTMLInputElement;
+
   // 40/60 resizable split (FR-UI-001).
   let leftPct = $state(40);
   let splitEl: HTMLDivElement;
@@ -83,6 +100,7 @@
     embed: (t: string) => Promise<number[]>;
     search: (v: number[], k: number) => Promise<SearchHit[]>;
     relate: (qid: string, hs: SearchHit[]) => Promise<void>;
+    ingest: (docId: string, text: string) => Promise<void>;
     provider: {
       loadModel: (m: string, cb: (p: number) => void) => Promise<void>;
       generate: (
@@ -130,14 +148,13 @@
       await store.connect('mem://', EMBEDDING_DIM);
     }
 
-    status = 'indexing vault…';
-    for (const note of VAULT) {
-      const cs = chunk(note.text, { size: 60, overlap: 12, countTokens });
+    const indexNote = async (docId: string, text: string) => {
+      const cs = chunk(text, { size: 60, overlap: 12, countTokens });
       const vecs = await embedBatch(cs.map((c) => c.text));
       await store.upsertChunks(
         cs.map((c, i) => ({
-          chunkId: `${note.docId}#${c.seq}`,
-          docId: note.docId,
+          chunkId: `${docId}#${c.seq}`,
+          docId,
           text: c.text,
           page: c.page,
           charStart: c.charStart,
@@ -145,7 +162,10 @@
           embedding: vecs[i]
         }))
       );
-    }
+    };
+
+    status = 'indexing vault…';
+    for (const note of vault) await indexNote(note.docId, note.text);
 
     const provider = new WebLLMProvider();
     pipe = {
@@ -156,11 +176,89 @@
           qid,
           hs.map((h) => ({ chunkId: h.chunkId, score: h.score }))
         ),
+      ingest: indexNote,
       provider
     };
     status = 'ready';
     ready = true;
   });
+
+  const today = (): string => new Date().toISOString().slice(0, 10);
+
+  // Multi-format ingestion (FR-ING-001/012): drop/pick PDF/CSV/TXT/MD → Markdown Proxy Note.
+  async function ingestFiles(list: FileList | null) {
+    if (!pipe || !ready || !list || list.length === 0) return;
+    for (const file of Array.from(list)) {
+      importMsg = `ingesting ${file.name}…`;
+      try {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        const res = intake({ name: file.name, bytes });
+        if (!res.ok) {
+          importMsg = `skipped ${file.name}: ${res.reason}`;
+          continue;
+        }
+        let body = '';
+        let sourcePath: string | undefined;
+        if (res.type === 'pdf') {
+          try {
+            const { extractPdf } = await import('$lib/ingest/pdf');
+            body = (await extractPdf(bytes)).text;
+          } catch {
+            importMsg = `PDF parsing needs the desktop app — skipped ${file.name}`;
+            continue;
+          }
+          sourcePath = `sources/${file.name}`;
+        } else if (res.type === 'csv') {
+          body = csvToMarkdown(res.text ?? '');
+          sourcePath = `sources/${file.name}`;
+        } else {
+          body = res.text ?? '';
+        }
+        if (!body.trim()) {
+          importMsg = `nothing to index in ${file.name}`;
+          continue;
+        }
+        const stem = file.name.replace(/\.[^.]+$/, '');
+        const docId = sourcePath ? proxyNotePath(sourcePath) : `notes/${stem}.md`;
+        const note = buildProxyNote({
+          sourcePath,
+          body,
+          now: today(),
+          taggableLater: !!sourcePath
+        });
+        await pipe.ingest(docId, body);
+        vault = [
+          ...vault.filter((n) => n.docId !== docId),
+          {
+            docId,
+            title: stem,
+            aliases: [],
+            text: body,
+            kind: res.type,
+            sourcePath,
+            frontmatter: note.frontmatter
+          }
+        ];
+        if (sourcePath) {
+          originals = [
+            ...originals.filter((o) => o.path !== sourcePath),
+            { path: sourcePath, bytes }
+          ];
+        }
+        importMsg = `✓ ingested ${docId} (${res.type})`;
+        showSource(docId);
+      } catch (e) {
+        importMsg = `error on ${file.name}: ${e instanceof Error ? e.message : String(e)}`;
+      }
+    }
+    if (fileInput) fileInput.value = '';
+  }
+
+  function onDrop(e: DragEvent) {
+    e.preventDefault();
+    dropActive = false;
+    void ingestFiles(e.dataTransfer?.files ?? null);
+  }
 
   async function ask() {
     if (!pipe || busy || !query.trim()) return;
@@ -235,7 +333,12 @@
 
   function exportVault() {
     const zip = exportVaultZip({
-      notes: VAULT.map((n) => ({ path: n.docId, frontmatter: { title: n.title }, body: n.text }))
+      notes: vault.map((n) => ({
+        path: n.docId,
+        frontmatter: n.frontmatter ?? { title: n.title },
+        body: n.text
+      })),
+      originals
     });
     const url = URL.createObjectURL(new Blob([new Uint8Array(zip)], { type: 'application/zip' }));
     const a = document.createElement('a');
@@ -247,9 +350,9 @@
 
   // Weaver popover (FR-LINK-002).
   function showPreview(e: MouseEvent, docId: string) {
-    const ref = noteRefs.find((r) => r.docId === docId);
+    const ref = vault.find((r) => r.docId === docId);
     preview = {
-      text: notePreview({ summary: ref?.summary }),
+      text: notePreview({ summary: ref?.text }),
       x: e.clientX + 12,
       y: e.clientY + 12
     };
@@ -274,7 +377,7 @@
     if (e.key === 'ArrowRight') leftPct = Math.min(70, leftPct + 2);
   }
 
-  const activeNote = $derived(activeDoc ? VAULT.find((n) => n.docId === activeDoc) : undefined);
+  const activeNote = $derived(activeDoc ? vault.find((n) => n.docId === activeDoc) : undefined);
 </script>
 
 <main class="shell">
@@ -284,7 +387,7 @@
     <button
       class="eject"
       onclick={exportVault}
-      title="Export the whole vault as a portable .zip (FR-DATA-006)"
+      title="Export the vault as a portable .zip — .md proxies + original binaries (FR-DATA-006)"
     >
       ⤓ Export Vault
     </button>
@@ -395,13 +498,45 @@
       aria-label="Resize panes (arrow keys)"
     ></button>
 
-    <!-- RIGHT (60%) — the Reference zone: document viewer / vault -->
-    <section class="pane viewer" aria-label="Document viewer">
+    <!-- RIGHT (60%) — the Reference zone: document viewer / vault / drop target -->
+    <section
+      class="pane viewer"
+      class:drop={dropActive}
+      aria-label="Document viewer and ingestion drop zone"
+      ondragover={(e) => {
+        e.preventDefault();
+        dropActive = true;
+      }}
+      ondragleave={() => (dropActive = false)}
+      ondrop={onDrop}
+    >
+      <div class="toolbar">
+        <button class="addfiles" onclick={() => fileInput?.click()} disabled={!ready}>
+          ＋ Add files
+        </button>
+        <span class="hint">PDF · CSV · TXT · MD — or drop anywhere here</span>
+        {#if importMsg}<span class="importmsg">{importMsg}</span>{/if}
+      </div>
+      <input
+        class="hidden-input"
+        type="file"
+        multiple
+        accept=".pdf,.csv,.txt,.md,.markdown,.text"
+        bind:this={fileInput}
+        onchange={(e) => ingestFiles((e.currentTarget as HTMLInputElement).files)}
+      />
+
       {#if activeNote}
         <div class="block-h">
           {activeNote.docId}{activeSpan ? ' · cited span highlighted' : ''}
+          {#if activeNote.kind}<span class="badge">{activeNote.kind}</span>{/if}
           <button class="back" onclick={() => (activeDoc = null)}>✕ vault</button>
         </div>
+        {#if activeNote.sourcePath}
+          <div class="source-link">
+            📎 source: {activeNote.sourcePath} — original preserved, never edited
+          </div>
+        {/if}
         <article class="doc">
           {#if activeSpan}
             {@const seg = buildHighlightSegments(
@@ -415,10 +550,13 @@
           {/if}
         </article>
       {:else}
-        <div class="block-h">Vault — {VAULT.length} notes</div>
-        {#each VAULT as note (note.docId)}
+        <div class="block-h">Vault — {vault.length} notes</div>
+        {#each vault as note (note.docId)}
           <button class="note" onclick={() => showSource(note.docId)}>
-            <div class="note-title">{note.docId}</div>
+            <div class="note-title">
+              {note.docId}
+              {#if note.kind}<span class="badge">{note.kind}</span>{/if}
+            </div>
             <div class="note-body">{note.text}</div>
           </button>
         {/each}
@@ -497,6 +635,62 @@
     flex: 1;
     background: #fff;
   }
+  .viewer.drop {
+    outline: 2px dashed #6750a4;
+    outline-offset: -8px;
+    background: #faf8ff;
+  }
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 0.7rem;
+    flex-wrap: wrap;
+  }
+  .addfiles {
+    font: inherit;
+    font-size: 0.78rem;
+    cursor: pointer;
+    background: #6750a4;
+    color: #fff;
+    border: 0;
+    border-radius: 7px;
+    padding: 0.25rem 0.7rem;
+  }
+  .addfiles:disabled {
+    opacity: 0.5;
+  }
+  .hint {
+    font-size: 0.74rem;
+    color: #9a9aa2;
+  }
+  .importmsg {
+    font-size: 0.74rem;
+    color: #1a7f37;
+    margin-left: auto;
+  }
+  .hidden-input {
+    display: none;
+  }
+  .source-link {
+    font-size: 0.76rem;
+    color: #6750a4;
+    background: #f5f2fd;
+    border: 1px solid #e7e0f8;
+    border-radius: 7px;
+    padding: 0.3rem 0.5rem;
+    margin-bottom: 0.6rem;
+  }
+  .badge {
+    font-size: 0.64rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    background: #efeaf8;
+    color: #6750a4;
+    border-radius: 5px;
+    padding: 0 5px;
+    margin-left: 4px;
+  }
   .divider {
     width: 6px;
     padding: 0;
@@ -563,6 +757,8 @@
     font-size: 0.82rem;
     color: #555;
     margin-top: 0.25rem;
+    overflow: hidden;
+    max-height: 3rem;
   }
   .doc {
     font-size: 0.9rem;
