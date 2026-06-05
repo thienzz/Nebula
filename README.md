@@ -40,8 +40,16 @@ npm run test:models               # real bge embeddings (downloads ~130 MB first
 cargo test --manifest-path src-tauri/Cargo.toml   # Rust: fs_scope, model hash verify
 ```
 
-105+ automated tests across TypeScript and Rust. CI uses the `InferenceProvider` mock (no GPU);
+157+ automated tests across TypeScript and Rust. CI uses the `InferenceProvider` mock (no GPU);
 WebGPU chat runs on a real GPU box or a driven browser.
+
+Nebula ingests **PDF / CSV / TXT / MD**; every import becomes a portable **Markdown Proxy Note**
+(`notes/<stem>.md` with a `source:` backlink) over the untouched original in `sources/`, so
+Export Vault round-trips 1:1 into Obsidian.
+
+The **"Obsidian DNA"** layer (Export Vault, the Weaver auto-wikilinks, the Micro-Map retrieval
+sub-graph, lazy-YAML auto-tagging, Magic Jump) is specified in [`docs/01-product/OBSIDIAN-DNA.md`](docs/01-product/OBSIDIAN-DNA.md);
+its deterministic cores are implemented and gated.
 
 ## Architecture
 

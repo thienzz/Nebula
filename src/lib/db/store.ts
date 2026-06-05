@@ -3,7 +3,7 @@
 // `indxdb://nebula` in the webview (DATA-MODEL §1, ADR-008). The store is a derived,
 // rebuildable cache (FR-DATA-002) — the `.md` files remain the source of truth.
 
-import { Surreal } from 'surrealdb';
+import { RecordId, Surreal } from 'surrealdb';
 import { surrealdbWasmEngines } from '@surrealdb/wasm';
 import { EMBEDDING_DIM } from '$lib/inference/provider';
 import type { SearchHit } from '$lib/inference/provider';
@@ -91,6 +91,49 @@ export class VectorStore {
   /** Remove all chunks for a document (re-index / delete — FR-DATA-002/003). */
   async deleteDoc(docId: string): Promise<void> {
     await this.conn.query('DELETE chunk WHERE docId = $docId', { docId });
+  }
+
+  /**
+   * Record the retrieval sub-graph for a query as SurrealDB graph edges (FR-GRAPH-002,
+   * OBSIDIAN-DNA §5.3): `RELATE query:⟨id⟩ -> retrieved_from -> chunk:⟨id⟩`, carrying the
+   * cosine score + rank. Re-relating the same query replaces its prior edges so the
+   * Micro-Map reflects only the latest turn.
+   */
+  async relateRetrieval(
+    queryId: string,
+    hits: { chunkId: string; score: number }[]
+  ): Promise<void> {
+    await this.clearRetrieval(queryId);
+    const q = new RecordId('query', queryId);
+    for (let i = 0; i < hits.length; i++) {
+      await this.conn.query('RELATE $q->retrieved_from->$c SET score = $score, rank = $rank', {
+        q,
+        c: new RecordId('chunk', hits[i].chunkId),
+        score: hits[i].score,
+        rank: i + 1
+      });
+    }
+  }
+
+  /** Read back a query's retrieval sub-graph, ordered by rank (FR-GRAPH-001 render input). */
+  async getRetrievalSubgraph(
+    queryId: string
+  ): Promise<{ chunkId: string; docId: string; score: number; rank: number }[]> {
+    const [rows] = await this.conn.query<
+      [{ chunkId: string; docId: string; score: number; rank: number }[]]
+    >(
+      `SELECT out.chunkId AS chunkId, out.docId AS docId, score, rank
+       FROM retrieved_from WHERE in = $q ORDER BY rank`,
+      { q: new RecordId('query', queryId) }
+    );
+    return rows ?? [];
+  }
+
+  /** Drop a query's edges — the Micro-Map is ephemeral per conversation turn (FR-GRAPH-002). */
+  async clearRetrieval(queryId: string): Promise<void> {
+    await this.conn.query('DELETE retrieved_from WHERE in = $q', {
+      q: new RecordId('query', queryId)
+    });
   }
 
   async count(): Promise<number> {

@@ -4,10 +4,10 @@
 // app stays responsive (others continue). PDF extraction itself runs later in the
 // parser Worker (pdfjs); here we only classify and decode text formats.
 
-export type IntakeType = 'pdf' | 'md' | 'txt';
+export type IntakeType = 'pdf' | 'md' | 'txt' | 'csv';
 
 export type IntakeResult =
-  | { ok: true; type: IntakeType; text?: string } // `text` for md/txt; pdf parsed later
+  | { ok: true; type: IntakeType; text?: string } // `text` for md/txt/csv; pdf parsed later
   | { ok: false; status: 'skipped' | 'failed'; code: string; reason: string };
 
 const EXT_TO_TYPE: Record<string, IntakeType> = {
@@ -15,7 +15,8 @@ const EXT_TO_TYPE: Record<string, IntakeType> = {
   md: 'md',
   markdown: 'md',
   txt: 'txt',
-  text: 'txt'
+  text: 'txt',
+  csv: 'csv'
 };
 
 export const DEFAULT_MAX_FILE_MB = 100; // FR-ING-010
@@ -43,8 +44,9 @@ export interface IntakeOptions {
  * Gate a file before ingestion (FR-ING-001/010):
  * - unsupported type → `skipped` (UNSUPPORTED)
  * - over the size cap → `failed` (OVERSIZED) without attempting to parse
- * - non-UTF-8 md/txt → `failed` (UNDECODABLE)
- * - md/txt → ok, with decoded `text`; pdf → ok (parsed later in the Worker)
+ * - non-UTF-8 md/txt/csv → `failed` (UNDECODABLE)
+ * - md/txt/csv → ok, with decoded `text` (CSV is rendered to a Markdown table downstream);
+ *   pdf → ok (parsed later in the Worker)
  */
 export function intake(
   file: { name: string; bytes: Uint8Array },
