@@ -28,6 +28,21 @@ interface ChunkRow {
   dist: number;
 }
 
+/**
+ * A persisted note document (FR-DATA-001). In a browser/webview build there are no `.md` files on
+ * disk, so the note's own content must be stored durably here (alongside its derived chunks) or it
+ * is lost on refresh. This table IS the source of truth for the vault in that context.
+ */
+export interface NoteRecord {
+  docId: string;
+  title: string;
+  body: string;
+  aliases?: string[];
+  kind?: string;
+  sourcePath?: string;
+  frontmatter?: Record<string, unknown>;
+}
+
 export class VectorStore {
   private db: Surreal | null = null;
 
@@ -36,9 +51,14 @@ export class VectorStore {
     const db = new Surreal({ engines: surrealdbWasmEngines() });
     await db.connect(url);
     await db.use({ namespace: 'nebula', database: 'nebula' });
+    // IF NOT EXISTS is ESSENTIAL: on a PERSISTED indxdb store the tables/index already exist from a
+    // prior session, and a bare `DEFINE TABLE` throws "already exists" — which made connect() fall
+    // back to mem://, silently discarding all persistence (the "notes always lost" bug). Idempotent
+    // definitions let a returning session reuse the persisted data instead of starting empty.
     await db.query(
-      `DEFINE TABLE chunk SCHEMALESS;
-       DEFINE INDEX hnsw_idx ON chunk FIELDS embedding HNSW DIMENSION ${dimension} DIST COSINE;`
+      `DEFINE TABLE IF NOT EXISTS chunk SCHEMALESS;
+       DEFINE INDEX IF NOT EXISTS hnsw_idx ON chunk FIELDS embedding HNSW DIMENSION ${dimension} DIST COSINE;
+       DEFINE TABLE IF NOT EXISTS note SCHEMALESS;`
     );
     this.db = db;
   }
@@ -91,6 +111,56 @@ export class VectorStore {
   /** Remove all chunks for a document (re-index / delete — FR-DATA-002/003). */
   async deleteDoc(docId: string): Promise<void> {
     await this.conn.query('DELETE chunk WHERE docId = $docId', { docId });
+  }
+
+  /**
+   * Persist a note document (FR-DATA-001), keyed by docId so a save/edit overwrites in place.
+   * This is what makes hand-written notes survive a refresh in the browser build (no `.md` on disk).
+   */
+  async upsertNote(note: NoteRecord): Promise<void> {
+    await this.conn.query(
+      'UPSERT type::thing("note", $id) CONTENT { docId: $id, title: $title, body: $body, aliases: $aliases, kind: $kind, sourcePath: $sourcePath, frontmatter: $fm }',
+      {
+        id: note.docId,
+        title: note.title,
+        body: note.body,
+        aliases: note.aliases ?? [],
+        kind: note.kind ?? null,
+        sourcePath: note.sourcePath ?? null,
+        fm: note.frontmatter ?? {}
+      }
+    );
+  }
+
+  /** All persisted notes (the vault), for rehydrating on startup. */
+  async allNotes(): Promise<NoteRecord[]> {
+    const [rows] = await this.conn.query<
+      [
+        {
+          docId: string;
+          title: string;
+          body: string;
+          aliases: string[] | null;
+          kind: string | null;
+          sourcePath: string | null;
+          frontmatter: Record<string, unknown> | null;
+        }[]
+      ]
+    >('SELECT docId, title, body, aliases, kind, sourcePath, frontmatter FROM note');
+    return (rows ?? []).map((r) => ({
+      docId: r.docId,
+      title: r.title,
+      body: r.body,
+      aliases: r.aliases ?? [],
+      kind: r.kind ?? undefined,
+      sourcePath: r.sourcePath ?? undefined,
+      frontmatter: r.frontmatter ?? undefined
+    }));
+  }
+
+  /** Forget a persisted note (FR-NOTE-009). Its chunks are dropped separately via deleteDoc. */
+  async deleteNote(docId: string): Promise<void> {
+    await this.conn.query('DELETE type::thing("note", $id)', { id: docId });
   }
 
   /**

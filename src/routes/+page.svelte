@@ -7,6 +7,7 @@
   // Export Vault → .zip of .md proxies + original binaries under sources/ (FR-DATA-006). In-browser.
   import { onMount, tick } from 'svelte';
   import type { SearchHit } from '$lib/inference/provider';
+  import type { NoteRecord } from '$lib/db/store';
   import { buildTitleIndex, weaveLinks, notePreview, type WovenSegment } from '$lib/weave/weaver';
   import { buildMicroGraph, type MicroGraph } from '$lib/graph/micrograph';
   import { resolveCitationTarget, buildHighlightSegments } from '$lib/chat/citation';
@@ -192,6 +193,8 @@
       onProgress?: (done: number, total: number) => void
     ) => Promise<void>;
     removeDoc: (docId: string) => Promise<void>;
+    putNote: (note: NoteRecord) => Promise<void>;
+    forgetNote: (docId: string) => Promise<void>;
     provider: {
       isCached: (m: string) => Promise<boolean>;
       loadModel: (m: string, cb: (p: number) => void) => Promise<void>;
@@ -233,7 +236,9 @@
     try {
       // -m3 namespace: the 1024-dim bge-m3 index must not collide with an old 384-dim store (ADR-021).
       await store.connect('indxdb://nebula-app-m3', EMBEDDING_DIM);
-    } catch {
+    } catch (e) {
+      // mem:// means NOTHING persists across refresh — surface it rather than silently losing notes.
+      console.warn('Nebula: persistent store unavailable, falling back to in-memory:', e);
       await store.connect('mem://', EMBEDDING_DIM);
     }
 
@@ -256,8 +261,37 @@
       );
     };
 
-    status = 'indexing vault…';
-    for (const note of vault) await indexNote(note.docId, note.text);
+    // Rehydrate the vault from the persisted `note` table (FR-DATA-001). In the browser build there
+    // are no `.md` files on disk, so this table IS the source of truth — without it every saved note
+    // is lost on refresh. First run (empty table) → seed the demo notes, persist + index them once;
+    // later runs → load the saved notes and DO NOT re-embed (their chunks already persist in indxdb).
+    const saved = await store.allNotes();
+    if (saved.length > 0) {
+      status = 'loading notes…';
+      vault = saved.map((n) => ({
+        docId: n.docId,
+        title: n.title,
+        aliases: n.aliases ?? [],
+        text: n.body,
+        kind: n.kind,
+        sourcePath: n.sourcePath,
+        frontmatter: n.frontmatter
+      }));
+    } else {
+      status = 'indexing vault…';
+      for (const note of vault) {
+        await store.upsertNote({
+          docId: note.docId,
+          title: note.title,
+          body: note.text,
+          aliases: note.aliases,
+          kind: note.kind,
+          sourcePath: note.sourcePath,
+          frontmatter: note.frontmatter
+        });
+        await indexNote(note.docId, note.text);
+      }
+    }
 
     const provider = new WebLLMProvider();
     pipe = {
@@ -270,6 +304,8 @@
         ),
       ingest: indexNote,
       removeDoc: (docId) => store.deleteDoc(docId),
+      putNote: (note) => store.upsertNote(note),
+      forgetNote: (docId) => store.deleteNote(docId),
       provider
     };
     status = 'ready';
@@ -320,6 +356,15 @@
           taggableLater: !!sourcePath
         });
         await pipe.ingest(docId, body);
+        await pipe.putNote({
+          docId,
+          title: stem,
+          body,
+          aliases: [],
+          kind: res.type,
+          sourcePath,
+          frontmatter: note.frontmatter
+        });
         vault = [
           ...vault.filter((n) => n.docId !== docId),
           {
@@ -441,6 +486,14 @@
       // linkable, editable — and the editor frees immediately. Embedding runs in the BACKGROUND
       // queue, so a long note never locks the editor; it becomes searchable when its job drains.
       const title = String(file.note.frontmatter.title ?? draftTitle);
+      const noteRec: NoteRecord = {
+        docId: file.docId,
+        title,
+        body,
+        aliases: [],
+        kind: 'note',
+        frontmatter: file.note.frontmatter
+      };
       vault = [
         ...vault.filter((n) => n.docId !== file.docId && n.docId !== editingDocId),
         {
@@ -452,6 +505,10 @@
           frontmatter: file.note.frontmatter
         }
       ];
+      // Persist the note doc durably FIRST (fast DB write) so it survives a refresh even before its
+      // embeddings finish (FR-DATA-001). An edit that changed the path also forgets the old record.
+      if (oldDocId && oldDocId !== file.docId) await pipe.forgetNote(oldDocId);
+      await pipe.putNote(noteRec);
       enqueueIndex(file.docId, body, oldDocId);
       editMsg = `✓ saved ${file.docId}`;
       // Notes are primary: flow straight into a fresh note (date pre-filled), with the folder
@@ -481,6 +538,7 @@
     if (!pipe || !ready) return;
     if (!confirm(`Delete ${docId}?\nThis removes it from the vault and the search index.`)) return;
     await pipe.removeDoc(docId);
+    await pipe.forgetNote(docId); // drop the persisted note doc too, so it stays deleted after refresh
     vault = vault.filter((n) => n.docId !== docId);
     if (activeDoc === docId) {
       activeDoc = null;
@@ -542,6 +600,30 @@
           frontmatter: file.note.frontmatter
         }
       ]);
+    // Persist: forget the old path, store the renamed note, and re-store every link-rewritten note.
+    await pipe.forgetNote(note.docId);
+    await pipe.putNote({
+      docId: file.docId,
+      title: newTitleStr,
+      body: note.text,
+      aliases: note.aliases ?? [],
+      kind: note.kind,
+      sourcePath: note.sourcePath,
+      frontmatter: file.note.frontmatter
+    });
+    for (const n of vault) {
+      if (rewrites.has(n.docId)) {
+        await pipe.putNote({
+          docId: n.docId,
+          title: n.title,
+          body: n.text,
+          aliases: n.aliases,
+          kind: n.kind,
+          sourcePath: n.sourcePath,
+          frontmatter: n.frontmatter
+        });
+      }
+    }
     if (activeDoc === note.docId) activeDoc = file.docId;
     if (editingDocId === note.docId) editingDocId = file.docId;
     editMsg = `✓ renamed → ${file.docId}${rewrites.size ? ` (rewrote ${rewrites.size} link${rewrites.size > 1 ? 's' : ''})` : ''}`;
@@ -549,7 +631,7 @@
 
   // Move a note to another folder (FR-NOTE-008): the filename (slug) and title are unchanged, so
   // title-based wikilinks keep resolving — only the docId/path changes, re-keyed in the index.
-  function moveNoteAction(note: Note) {
+  async function moveNoteAction(note: Note) {
     if (!pipe || !ready) return;
     const currentFolder = note.docId.slice(0, note.docId.lastIndexOf('/')) || 'notes';
     const next = prompt('Move note — destination folder:', currentFolder);
@@ -561,6 +643,17 @@
     );
     if (newDocId === note.docId) return;
     reindexAs(note.docId, newDocId, note.text);
+    // Persist the path change so the move survives a refresh.
+    await pipe.forgetNote(note.docId);
+    await pipe.putNote({
+      docId: newDocId,
+      title: note.title,
+      body: note.text,
+      aliases: note.aliases,
+      kind: note.kind,
+      sourcePath: note.sourcePath,
+      frontmatter: note.frontmatter
+    });
     vault = vault.filter((n) => n.docId !== note.docId).concat([{ ...note, docId: newDocId }]);
     if (activeDoc === note.docId) activeDoc = newDocId;
     if (editingDocId === note.docId) editingDocId = newDocId;
@@ -592,11 +685,20 @@
       existingPaths: vault.map((n) => n.docId)
     });
     await pipe.ingest(file.docId, body);
+    const dailyTitle = String(file.note.frontmatter.title ?? dailyNoteTitle(nowIso));
+    await pipe.putNote({
+      docId: file.docId,
+      title: dailyTitle,
+      body,
+      aliases: [],
+      kind: 'note',
+      frontmatter: file.note.frontmatter
+    });
     vault = [
       ...vault,
       {
         docId: file.docId,
-        title: String(file.note.frontmatter.title ?? dailyNoteTitle(nowIso)),
+        title: dailyTitle,
         aliases: [],
         text: body,
         kind: 'note',

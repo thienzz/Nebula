@@ -67,3 +67,42 @@ describe('VectorStore — real HNSW cosine search', () => {
     expect(hits.map((h) => h.docId)).not.toContain('cats');
   });
 });
+
+describe('VectorStore — note persistence (FR-DATA-001, survives refresh in the browser build)', () => {
+  it('upserts notes, reads them all back, and overwrites by docId', async () => {
+    store = new VectorStore();
+    await store.connect('mem://', 3);
+    await store.upsertNote({
+      docId: 'notes/a.md',
+      title: 'Alpha',
+      body: 'hello',
+      aliases: ['al'],
+      frontmatter: { tags: ['x'] }
+    });
+    await store.upsertNote({ docId: 'clients/acme/b.md', title: 'Beta', body: 'world' });
+
+    let all = await store.allNotes();
+    expect(all.map((n) => n.docId).sort()).toEqual(['clients/acme/b.md', 'notes/a.md']);
+    const a = all.find((n) => n.docId === 'notes/a.md')!;
+    expect(a.title).toBe('Alpha');
+    expect(a.body).toBe('hello');
+    expect(a.aliases).toEqual(['al']);
+    expect(a.frontmatter).toEqual({ tags: ['x'] });
+
+    // re-save same docId → overwrite, not duplicate (an edit)
+    await store.upsertNote({ docId: 'notes/a.md', title: 'Alpha v2', body: 'edited' });
+    all = await store.allNotes();
+    expect(all).toHaveLength(2);
+    expect(all.find((n) => n.docId === 'notes/a.md')!.title).toBe('Alpha v2');
+  });
+
+  it('deleteNote forgets a note so it stays gone after reload', async () => {
+    store = new VectorStore();
+    await store.connect('mem://', 3);
+    await store.upsertNote({ docId: 'notes/a.md', title: 'A', body: 'x' });
+    await store.upsertNote({ docId: 'notes/b.md', title: 'B', body: 'y' });
+    await store.deleteNote('notes/a.md');
+    const all = await store.allNotes();
+    expect(all.map((n) => n.docId)).toEqual(['notes/b.md']);
+  });
+});
