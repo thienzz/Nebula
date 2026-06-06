@@ -31,6 +31,21 @@ export interface GenerateResult {
 
 export type Backend = 'webgpu' | 'metal' | 'vulkan' | 'cuda';
 
+/** Low-level single-shot completion (FR-CHAT-006) — raw system+user → streamed text, no RAG
+ *  prompt assembly or citation parsing. The whole-note map-reduce reader builds its own prompts
+ *  and drives the model through this; `generate` remains the grounded/cited chunk-RAG path. */
+export interface CompleteRequest {
+  system: string;
+  user: string;
+  maxTokens: number;
+}
+
+export interface CompleteResult {
+  text: string;
+  ttftMs: number;
+  tokensPerSec: number;
+}
+
 export interface InferenceProvider {
   readonly id: 'webllm' | 'native-rust';
   capabilities(): { chat: boolean; maxContextTokens: number; backend: Backend };
@@ -42,6 +57,12 @@ export interface InferenceProvider {
     onToken: (t: string) => void,
     signal: AbortSignal
   ): Promise<GenerateResult>;
+  // Raw streamed completion for the whole-note reader (FR-CHAT-006). Honors AbortSignal.
+  complete(
+    req: CompleteRequest,
+    onToken: (t: string) => void,
+    signal: AbortSignal
+  ): Promise<CompleteResult>;
   unload(): Promise<void>;
 }
 

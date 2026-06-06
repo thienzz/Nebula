@@ -54,6 +54,7 @@
   } from '$lib/retrieval/search';
   import { sourcesFromNotes, sourcesFromHits, parseRedactions } from '$lib/context/sources';
   import { compile } from '$lib/context/compiler';
+  import { answerOverNotes, type ReadSource } from '$lib/chat/longread';
 
   type Note = {
     docId: string;
@@ -214,6 +215,12 @@
     provider: {
       isCached: (m: string) => Promise<boolean>;
       loadModel: (m: string, cb: (p: number) => void) => Promise<void>;
+      capabilities: () => { chat: boolean; maxContextTokens: number; backend: string };
+      complete: (
+        req: { system: string; user: string; maxTokens: number },
+        onTok: (t: string) => void,
+        sig: AbortSignal
+      ) => Promise<{ text: string; ttftMs: number; tokensPerSec: number }>;
       generate: (
         req: {
           requestId: string;
@@ -854,15 +861,12 @@
       status = 'embedding query…';
       const qv = await pipe.embed(query);
       status = scope ? `retrieving (scoped: ${scopeLabel(scope)})…` : 'retrieving…';
-      // Scoped retrieval (FR-RET-004): over-fetch then keep only in-scope hits so a question
-      // about one client never pulls another client's notes (no cross-client bleed).
+      // Retrieval is used ONLY to rank notes + drive the References/Micro-Map view ("why this
+      // answer"). It does NOT decide what the model sees — see the context block below.
       const raw = filterByScope(await pipe.search(qv, scope ? 24 : 12), scopeIds);
-      // Precision pass on the over-fetch (ADR-018): drop the low-score tail so References,
-      // Micro-Map, and the grounded context carry only genuinely relevant notes — a 0.31 cosine
-      // hit is noise the small model would otherwise be asked to reconcile (FR-CHAT-002).
       const relevant = relevantHits(raw);
-      // Favor BREADTH across distinct relevant documents (FR-CHAT-002): one best chunk per doc,
-      // up to 5 docs — so the answer synthesizes several notes at once and can reference them all.
+      // References + Micro-Map surface the most-relevant notes (up to 5) so the user can see/jump to
+      // the strongest sources; the answer itself still reads the WHOLE knowledge base (below).
       hits = dedupeByDoc(relevant, 5);
       references = referencesFromHits(hits);
       // Micro-Map (FR-GRAPH-001) + persist the retrieval sub-graph edges (FR-GRAPH-002).
@@ -882,31 +886,43 @@
       }
 
       status = 'generating…';
-      const res = await pipe.provider.generate(
-        // Reason mode elaborates, so give it more room than the terse grounded answer.
-        {
-          requestId: 'q',
-          query,
-          context: hits,
-          modelId,
-          maxTokens: answerMode === 'reason' ? 512 : 256,
-          answerMode
-        },
+      // CONTEXT = the WHOLE knowledge base in scope, not a retrieved subset (FR-CHAT-006). The user
+      // asks the LLM over ALL their in-scope notes — so "how many notes greet me?" / "reply to each"
+      // sees every note, not just the top few. Retrieval only ORDERS them (most-relevant first) so
+      // that if the vault is too big for one context window, the strongest notes land in the earliest
+      // map-reduce passes — but NOTHING is dropped. Whole notes go in (read end-to-end); notes longer
+      // than the window are read via map-reduce. (Scope/folder/tag still narrows the set when set.)
+      const inScope = scopeIds ? vault.filter((n) => scopeIds.has(n.docId)) : vault;
+      const rankByDoc = new Map<string, number>();
+      relevant.forEach((h, i) => {
+        if (!rankByDoc.has(h.docId)) rankByDoc.set(h.docId, i);
+      });
+      const readSources: ReadSource[] = [...inScope]
+        .sort((a, b) => (rankByDoc.get(a.docId) ?? Infinity) - (rankByDoc.get(b.docId) ?? Infinity))
+        .filter((n) => n.text?.trim())
+        .map((n) => ({ docId: n.docId, text: n.text }));
+
+      const res = await answerOverNotes(
+        query,
+        readSources,
+        (req, onTok, sig) => pipe!.provider.complete(req, onTok, sig),
         (t) => {
           answer += t;
         },
-        new AbortController().signal
+        new AbortController().signal,
+        {
+          budgetTokens: pipe.provider.capabilities().maxContextTokens,
+          mode: answerMode,
+          // Enough room for a full explanation (a terse cap truncates mid-answer); reason elaborates.
+          maxAnswerTokens: answerMode === 'reason' ? 1024 : 640,
+          onStatus: (s) => (status = s)
+        }
       );
       ttft = res.ttftMs;
       tps = Math.round(res.tokensPerSec);
-      // Replace the streamed text with the provider's cleaned final answer (echo stripped).
+      // Replace the streamed text with the cleaned final answer (echo stripped).
       answer = res.text;
-      const order = hits.map((h) => h.chunkId);
-      cites = res.citations.map((c) => {
-        const docId = order.find((id) => id === c.chunkId) ? c.chunkId.split('#')[0] : c.chunkId;
-        const n = order.indexOf(c.chunkId) + 1;
-        return { n, chunkId: c.chunkId, docId };
-      });
+      cites = []; // whole-note mode cites by note (References list), not inline chunk numbers
       // The Weaver (FR-LINK-001): wrap note-title mentions in the finished answer as links.
       woven = weaveLinks(answer, titleIndex, { once: true });
       status = 'done';

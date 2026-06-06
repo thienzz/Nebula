@@ -4,7 +4,14 @@
 // degraded path. Verified end-to-end on a real NVIDIA GPU through the webllm-test route.
 
 import * as webllm from '@mlc-ai/web-llm';
-import type { InferenceProvider, GenerateRequest, GenerateResult, Backend } from './provider';
+import type {
+  InferenceProvider,
+  GenerateRequest,
+  GenerateResult,
+  CompleteRequest,
+  CompleteResult,
+  Backend
+} from './provider';
 import {
   assemblePrompt,
   parseCitations,
@@ -72,6 +79,50 @@ export class WebLLMProvider implements InferenceProvider {
       };
     }
 
+    const { text, ttftMs, tokensPerSec } = await this.streamChat(
+      prompt.system,
+      prompt.user,
+      undefined,
+      onToken,
+      signal
+    );
+    // Defensive: strip any echoed prompt scaffolding the small model emitted, then parse
+    // citations against the CLEANED text so spans line up with what the user sees.
+    const cleaned = stripPromptEcho(text);
+    const { citations } = parseCitations(cleaned, prompt.contextOrder);
+    return { requestId: req.requestId, text: cleaned, citations, ttftMs, tokensPerSec };
+  }
+
+  /**
+   * Raw streamed completion (FR-CHAT-006) — used by the whole-note map-reduce reader, which
+   * supplies its own system+user prompts. No RAG assembly, no citation parsing; just stream the
+   * model's text (echo scaffolding stripped) and honor cancellation.
+   */
+  async complete(
+    req: CompleteRequest,
+    onToken: (t: string) => void,
+    signal: AbortSignal
+  ): Promise<CompleteResult> {
+    if (!this.engine) throw new Error('Model not loaded');
+    const { text, ttftMs, tokensPerSec } = await this.streamChat(
+      req.system,
+      req.user,
+      req.maxTokens,
+      onToken,
+      signal
+    );
+    return { text: stripPromptEcho(text), ttftMs, tokensPerSec };
+  }
+
+  /** Shared streaming core for generate()/complete(): stream deltas, honor AbortSignal, time it. */
+  private async streamChat(
+    system: string,
+    user: string,
+    maxTokens: number | undefined,
+    onToken: (t: string) => void,
+    signal: AbortSignal
+  ): Promise<{ text: string; ttftMs: number; tokensPerSec: number }> {
+    if (!this.engine) throw new Error('Model not loaded');
     const start = performance.now();
     let ttftMs = 0;
     let tokens = 0;
@@ -82,9 +133,15 @@ export class WebLLMProvider implements InferenceProvider {
       // Low temperature → grounded, reproducible answers (RAG should not be creative).
       temperature: 0.2,
       top_p: 0.9,
+      // Penalize repetition: small on-device models fall into "say the same sentence forever" loops
+      // on repetitive context (e.g. many near-identical notes). These keep generation moving without
+      // pushing the model off the notes.
+      frequency_penalty: 0.5,
+      presence_penalty: 0.3,
+      ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),
       messages: [
-        { role: 'system', content: prompt.system },
-        { role: 'user', content: prompt.user }
+        { role: 'system', content: system },
+        { role: 'user', content: user }
       ]
     });
 
@@ -103,17 +160,7 @@ export class WebLLMProvider implements InferenceProvider {
     }
 
     const seconds = Math.max((performance.now() - start) / 1000, 1e-3);
-    // Defensive: strip any echoed prompt scaffolding the small model emitted, then parse
-    // citations against the CLEANED text so spans line up with what the user sees.
-    const cleaned = stripPromptEcho(text);
-    const { citations } = parseCitations(cleaned, prompt.contextOrder);
-    return {
-      requestId: req.requestId,
-      text: cleaned,
-      citations,
-      ttftMs,
-      tokensPerSec: tokens / seconds
-    };
+    return { text, ttftMs, tokensPerSec: tokens / seconds };
   }
 
   async unload(): Promise<void> {
