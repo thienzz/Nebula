@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { renderMarkdown, escapeHtml } from '../../src/lib/render/markdown';
+import { renderMarkdown, escapeHtml, linkifyCitations } from '../../src/lib/render/markdown';
 
 // FR-UI-002 (preview) · OBSIDIAN-DNA §5.10 · ADR-016. Safe-subset Markdown renderer.
 
@@ -90,5 +90,24 @@ describe('renderMarkdown — wikilinks', () => {
     const html = renderMarkdown('`[[Apollo]]`', { resolveLink });
     expect(html).toContain('<code>[[Apollo]]</code>');
     expect(html).not.toContain('class="wikilink"');
+  });
+});
+
+describe('linkifyCitations', () => {
+  it('wraps [#n] markers in a clickable cite button carrying its number', () => {
+    const out = linkifyCitations('Budget is blocked [#1] and Roland undercut us [#3].');
+    expect(out).toContain('<button type="button" class="cite" data-cite="1">[#1]</button>');
+    expect(out).toContain('<button type="button" class="cite" data-cite="3">[#3]</button>');
+  });
+
+  it('composes with rendered Markdown (markers survive renderMarkdown verbatim)', () => {
+    const html = linkifyCitations(renderMarkdown('- step one [#2]', {}));
+    expect(html).toContain(
+      '<li>step one <button type="button" class="cite" data-cite="2">[#2]</button></li>'
+    );
+  });
+
+  it('leaves text without markers untouched', () => {
+    expect(linkifyCitations('no citations here')).toBe('no citations here');
   });
 });

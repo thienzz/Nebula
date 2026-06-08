@@ -13,6 +13,20 @@ export interface RenderOptions {
   resolveLink?: (target: string) => { docId: string; title: string } | null;
 }
 
+/**
+ * Wrap inline `[#n]` citation markers (the chat answer's references to numbered context chunks) in a
+ * clickable button so Magic Jump can resolve n → source note on click. Pure + escape-safe: it only
+ * matches the literal `[#digits]` pattern, which `renderMarkdown` already passes through verbatim
+ * (escapeHtml leaves `[`, `#`, `]`, and digits untouched), so it composes with rendered Markdown HTML
+ * without re-parsing it. The caller maps `data-cite` → chunkId at click time. ALGORITHMS §18.
+ */
+export function linkifyCitations(html: string): string {
+  return html.replace(
+    /\[#(\d+)\]/g,
+    (_m, n: string) => `<button type="button" class="cite" data-cite="${n}">[#${n}]</button>`
+  );
+}
+
 /** Escape the five HTML-significant characters. Applied to ALL source-derived text. */
 export function escapeHtml(s: string): string {
   return s

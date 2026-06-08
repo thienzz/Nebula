@@ -71,19 +71,20 @@ export const CHAT_MODELS: ChatModel[] = [
   }
 ];
 
-// Models at/above this footprint are flagged "experimental" + need an explicit ack (FR-CAP-003).
-// NOTE: the WebGPU cap is ~2 GB PER BUFFER, not total — WebLLM shards weights into sub-2 GB buffers,
-// so 2.5–3 GB-total models (e.g. Qwen2.5-3B) load fine. Only the larger ones (7–8 B) risk a single
-// buffer exceeding the cap, which is why the gate sits at ~3.5 GB, above the reliable 3 B tier.
+// Models at/above this footprint get a one-time "large download" confirm (FR-CAP-003): a 3.5 GB+
+// model is a big one-time download and a heavier VRAM footprint, so we let the user opt in rather
+// than silently pulling gigabytes. This is purely a download/VRAM heads-up — NOT a hard load limit:
+// modern WebGPU shards weights into multiple buffers, so large models (7–8 B) load fine on capable
+// GPUs (verified: Qwen2.5-7B runs in the browser). The ack just prevents a surprise multi-GB pull.
 export const BIG_MODEL_MB = 3500;
 
-/** The id we recommend by default — best quality that loads reliably under the WebGPU per-buffer cap. */
+/** The id we recommend by default — the quality/size sweet spot for most machines. */
 export const RECOMMENDED_MODEL_ID = 'Qwen2.5-3B-Instruct-q4f16_1-MLC';
 
 /**
  * Recommend the best model for the detected hardware (FR-CAP-001). With WebGPU we suggest the
- * multilingual 3 B (the quality/reliability sweet spot — loads under the per-buffer cap, strong on
- * Vietnamese to pair with bge-m3). No WebGPU → null (chat unsupported; semantic search still works).
+ * multilingual 3 B (the quality/size sweet spot — modest download, strong on Vietnamese to pair
+ * with bge-m3). No WebGPU → null (chat unsupported; semantic search still works).
  */
 export function recommendModel(webgpu: boolean): ChatModel | null {
   if (!webgpu) return null;

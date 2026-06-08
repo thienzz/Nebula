@@ -8,7 +8,7 @@
   import { onMount, tick } from 'svelte';
   import type { SearchHit } from '$lib/inference/provider';
   import type { NoteRecord, ExpandedHit } from '$lib/db/store';
-  import { buildTitleIndex, weaveLinks, notePreview, type WovenSegment } from '$lib/weave/weaver';
+  import { buildTitleIndex, notePreview } from '$lib/weave/weaver';
   import { buildMicroGraph, type MicroGraph } from '$lib/graph/micrograph';
   import { selectGraphRagContext } from '$lib/retrieval/graphrag';
   import { ingestDocGraph } from '$lib/graph/ingest-graph';
@@ -40,7 +40,7 @@
     rewriteWikilinkTitle,
     type AutocompleteState
   } from '$lib/weave/wikilink';
-  import { renderMarkdown } from '$lib/render/markdown';
+  import { renderMarkdown, linkifyCitations } from '$lib/render/markdown';
   import { quickSwitch, type SwitchResult } from '$lib/nav/switcher';
   import {
     BUILTIN_TEMPLATES,
@@ -51,6 +51,15 @@
   } from '$lib/vault/template';
   import { buildFileTree, type TreeNode } from '$lib/nav/tree';
   import { layoutEntityGraph, entityColor, type GraphLayout } from '$lib/graph/graph-layout';
+  import {
+    applyOverrides,
+    zoomAt,
+    panBy,
+    toGraphPoint,
+    pxToViewBoxScale,
+    IDENTITY_VIEW,
+    type ViewTransform
+  } from '$lib/graph/graph-view';
   import {
     folderOf,
     isUnder,
@@ -138,7 +147,12 @@
   let modelId = $state(DEFAULT_MODEL_ID);
   let query = $state('Does Nebula upload my notes to a server?');
   let answer = $state('');
-  let woven = $state<WovenSegment[]>([]);
+  // The answer rendered as safe Markdown HTML (FR-CHAT-001) with clickable [#n] citations woven in —
+  // headings, lists, bold, tables format properly instead of showing raw Markdown. Magic Jump on a
+  // [#n] resolves via `references` (onRenderedClick). Empty until an answer streams in.
+  const answerHtml = $derived(
+    answer ? linkifyCitations(renderMarkdown(answer, { resolveLink: resolveNoteLink })) : ''
+  );
   let cites = $state<Cite[]>([]);
   let hits = $state<SearchHit[]>([]);
   let references = $state<SourceRef[]>([]); // distinct source docs behind the answer (FR-CHAT-002)
@@ -151,8 +165,7 @@
   let coi = $state(false);
   let modelCached = $state(false); // weights already on disk → fast load, no download (#4)
   let ackedModels = $state(new Set<string>()); // large models the user already OK'd (FR-CAP-003)
-  let gpuBufferLimitGB = $state(0); // WebGPU maxBufferSize cap (Chrome ≈ 2 GB) — gates large models
-  let gpu = $state<{ ok: boolean; vendor: string; arch: string; maxBufferGB: number } | null>(null);
+  let gpu = $state<{ ok: boolean; vendor: string; arch: string } | null>(null);
   let preloading = $state(false); // a background model preload is in flight
   let loadPhase = $state<'' | 'downloading' | 'loading' | 'compiling'>(''); // model-load stage
   let loadPct = $state(0); // 0–100 download/load progress for the gpu-bar bar
@@ -214,6 +227,15 @@
   let entityRelations = $state<RelationEdge[]>([]); // all relations, for the entity graph view
   let selectedEntity = $state<EntityEntry | null>(null); // open entity page
   let entityGraph = $state<EntityGraph | null>(null); // multi-hop sub-graph for the selected entity
+  // Interactive graph view (Phase 4): per-node drag positions + pan/zoom. Reset when a new entity opens.
+  let nodeOverrides = $state(new Map<string, { x: number; y: number }>());
+  let graphView = $state<ViewTransform>(IDENTITY_VIEW);
+  let svgEl = $state<SVGSVGElement | undefined>();
+  let drag = $state<
+    | { kind: 'node'; id: string; gx: number; gy: number; moved: boolean; px: number; py: number }
+    | { kind: 'pan'; px: number; py: number }
+    | null
+  >(null);
   let entityNotes = $state<string[]>([]); // docIds mentioning the selected entity
   let graphBusy = $state(false);
 
@@ -320,19 +342,17 @@
 
   onMount(async () => {
     coi = crossOriginIsolated;
-    // Probe WebGPU once at startup (FR-CAP-001, ADR-030): is chat possible, on what GPU, and what is
-    // the per-buffer cap (Chrome ≈ 2 GB — a single weight buffer above it can't load; this is a
-    // platform limit, not VRAM). Drives the GPU status line + the model recommendation.
+    // Probe WebGPU once at startup (FR-CAP-001, ADR-030): is chat possible and on what GPU? Drives the
+    // GPU status line + the model recommendation. (We deliberately do NOT read maxBufferSize as a load
+    // cap — WebLLM shards weights across buffers, so large models load fine on capable GPUs.)
     try {
       const adapter = await navigator.gpu?.requestAdapter();
       if (adapter) {
         gpu = {
           ok: true,
           vendor: adapter.info?.vendor || '',
-          arch: adapter.info?.architecture || '',
-          maxBufferGB: adapter.limits.maxBufferSize / 1e9
+          arch: adapter.info?.architecture || ''
         };
-        gpuBufferLimitGB = gpu.maxBufferGB;
       }
     } catch {
       /* no WebGPU → chat unsupported; semantic search still works (FR-CAP-002) */
@@ -672,6 +692,7 @@
     entityGraph = null;
     entityNotes = [];
     activeDoc = null;
+    resetGraphView();
     try {
       entityNotes = [...new Set((await pipe.mentionsForEntity(e.id)).map((m) => m.docId))].sort();
       const neighbors = await pipe.entityNeighbors(e.id, 2); // 1–2 hops (Phase 4 traversal)
@@ -690,6 +711,73 @@
     selectedEntity = null;
     entityGraph = null;
     entityNotes = [];
+    resetGraphView();
+  }
+
+  // --- Interactive entity graph: drag nodes + pan/zoom (Phase 4 visual) --------------------------
+  // Geometry is pure (graph-view.ts); these handlers only translate pointer/wheel events into it.
+  function resetGraphView() {
+    nodeOverrides = new Map();
+    graphView = IDENTITY_VIEW;
+    drag = null;
+  }
+  const DRAG_THRESHOLD = 4; // px the pointer must move before a node press counts as a drag, not a click
+
+  function graphPointFromEvent(ev: PointerEvent): { x: number; y: number } {
+    const rect = svgEl?.getBoundingClientRect();
+    const vbW = entityLayout?.width ?? 1;
+    const vbH = entityLayout?.height ?? 1;
+    if (!rect) return { x: 0, y: 0 };
+    return toGraphPoint(ev.clientX, ev.clientY, rect, vbW, vbH, graphView);
+  }
+
+  function onNodePointerDown(ev: PointerEvent, n: { id: string; x: number; y: number }) {
+    ev.stopPropagation(); // don't also start a background pan
+    const p = graphPointFromEvent(ev);
+    drag = { kind: 'node', id: n.id, gx: n.x - p.x, gy: n.y - p.y, moved: false, px: ev.clientX, py: ev.clientY }; // prettier-ignore
+    svgEl?.setPointerCapture(ev.pointerId);
+  }
+  function onGraphPointerDown(ev: PointerEvent) {
+    drag = { kind: 'pan', px: ev.clientX, py: ev.clientY };
+    svgEl?.setPointerCapture(ev.pointerId);
+  }
+  function onGraphPointerMove(ev: PointerEvent) {
+    if (!drag) return;
+    if (drag.kind === 'node') {
+      if (Math.hypot(ev.clientX - drag.px, ev.clientY - drag.py) > DRAG_THRESHOLD)
+        drag.moved = true;
+      const p = graphPointFromEvent(ev);
+      const next = new Map(nodeOverrides);
+      next.set(drag.id, { x: p.x + drag.gx, y: p.y + drag.gy });
+      nodeOverrides = next;
+    } else {
+      const rect = svgEl?.getBoundingClientRect();
+      const k = pxToViewBoxScale(rect?.width ?? 1, entityLayout?.width ?? 1);
+      graphView = panBy(graphView, (ev.clientX - drag.px) * k, (ev.clientY - drag.py) * k);
+      drag.px = ev.clientX;
+      drag.py = ev.clientY;
+    }
+  }
+  function onGraphPointerUp(ev: PointerEvent) {
+    // A node press that never moved is a click → open that entity (multi-hop browse).
+    if (drag?.kind === 'node' && !drag.moved) {
+      const id = drag.id;
+      const node = entityLayout?.nodes.find((n) => n.id === id);
+      if (node && node.hop !== 0) openEntityById(node.id);
+    }
+    svgEl?.releasePointerCapture?.(ev.pointerId);
+    drag = null;
+  }
+  function onGraphWheel(ev: WheelEvent) {
+    ev.preventDefault();
+    const rect = svgEl?.getBoundingClientRect();
+    const vbW = entityLayout?.width ?? 1;
+    const vbH = entityLayout?.height ?? 1;
+    if (!rect) return;
+    // Anchor the zoom on the cursor, in viewBox space (the <g> transform lives in viewBox units).
+    const vbX = ((ev.clientX - rect.left) / rect.width) * vbW;
+    const vbY = ((ev.clientY - rect.top) / rect.height) * vbH;
+    graphView = zoomAt(graphView, ev.deltaY < 0 ? 1.1 : 1 / 1.1, vbX, vbY);
   }
 
   /** Jump from a node in the entity graph to that entity's page (multi-hop browsing). */
@@ -1017,23 +1105,18 @@
   }
 
   /**
-   * Ensure `id` is the loaded chat model (FR-CAP-003/004): ack for experimental (7–8 B) models that
-   * may exceed the WebGPU per-buffer cap, cache-aware status, graceful failure. Returns true if it's
-   * loaded (or already current), false if declined/failed. Shared by Ask + preload.
+   * Ensure `id` is the loaded chat model (FR-CAP-003/004): a one-time "large download" confirm for
+   * the big models, cache-aware status, graceful failure. Returns true if it's loaded (or already
+   * current), false if declined/failed. Shared by Ask + preload.
    */
   async function ensureModelLoaded(id: string): Promise<boolean> {
     if (!pipe) return false;
     if (loadedModel === id) return true;
     if (needsOomAck(id) && !ackedModels.has(id)) {
       const m = modelById(id);
-      const limitNote =
-        gpuBufferLimitGB > 0
-          ? `\n\nYour browser's WebGPU limit is ~${gpuBufferLimitGB.toFixed(1)} GB per buffer (a ` +
-            `Chrome cap, not your VRAM). 7–8 B models may need a bigger single buffer and fail to ` +
-            `load; 1–3 B models load reliably.`
-          : '';
       const ok = confirm(
-        `${m?.label} needs ~${formatSize(m?.sizeMB ?? 0)}.${limitNote}\n\nDownload and try to load it anyway?`
+        `${m?.label} is a large model — about ${formatSize(m?.sizeMB ?? 0)} to download once ` +
+          `(then cached) and more VRAM to run.\n\nDownload and load it now?`
       );
       if (!ok) {
         modelId = loadedModel || DEFAULT_MODEL_ID;
@@ -1059,10 +1142,10 @@
       const m = modelById(id);
       const msg = err instanceof Error ? err.message : String(err);
       modelId = loadedModel || DEFAULT_MODEL_ID;
-      // Classify the failure so the guidance is actionable. The old code blamed EVERY failure on the
-      // WebGPU buffer cap ("pick a smaller model") — wrong for a network hiccup or a browser-STORAGE
-      // limit (e.g. "Failed to read large IndexedDB value" in a private window / quota-capped
-      // browser), where the right move is "retry" or "free space", not "downgrade the model".
+      // Classify the failure so the guidance is actionable. Blaming EVERY failure on model size
+      // ("pick a smaller model") is wrong for a network hiccup or a browser-STORAGE limit (e.g.
+      // "Failed to read large IndexedDB value" in a private window / quota-capped browser), where the
+      // right move is "retry" or "free space", not "downgrade the model".
       const isStorage = /indexeddb|quota|storage|read large|disk|no ?space/i.test(msg);
       const isDownload =
         /cache|network|fetch|failed to execute 'add'|http|50\d|429|timeout|load/i.test(msg);
@@ -1075,11 +1158,7 @@
           `⚠ ${m?.label ?? 'model'} download didn't finish — the model host (HuggingFace) may be ` +
           `busy/rate-limiting. Wait a moment and retry; already-downloaded parts resume. [${msg}]`;
       } else {
-        const cap =
-          gpuBufferLimitGB > 0
-            ? `~${gpuBufferLimitGB.toFixed(1)} GB WebGPU buffer cap`
-            : 'this GPU';
-        status = `⚠ ${m?.label ?? 'model'} couldn't load — it may exceed ${cap}. Pick a smaller model. [${msg}]`;
+        status = `⚠ ${m?.label ?? 'model'} couldn't load on this GPU. Try again, or pick a smaller model if it persists. [${msg}]`;
       }
       return false;
     }
@@ -1368,7 +1447,6 @@
     if (!pipe || busy || !query.trim()) return;
     busy = true;
     answer = '';
-    woven = [];
     cites = [];
     references = [];
     graph = null;
@@ -1464,8 +1542,6 @@
         const n = order.indexOf(c.chunkId) + 1;
         return { n, chunkId: c.chunkId, docId };
       });
-      // The Weaver (FR-LINK-001): wrap note-title mentions in the finished answer as links.
-      woven = weaveLinks(answer, titleIndex, { once: true });
       status = 'done';
       await tick();
     } catch (e) {
@@ -1553,10 +1629,20 @@
     return resolveTarget(target, titleIndex);
   }
   function onRenderedClick(e: MouseEvent) {
-    const a = (e.target as HTMLElement | null)?.closest?.('a.wikilink') as HTMLElement | null;
+    const el = e.target as HTMLElement | null;
+    const a = el?.closest?.('a.wikilink') as HTMLElement | null;
     if (a?.dataset.doc) {
       e.preventDefault();
       showSource(a.dataset.doc);
+      return;
+    }
+    // Magic Jump from an inline [#n] citation in a rendered answer → its source note.
+    const cite = el?.closest?.('button.cite') as HTMLElement | null;
+    if (cite?.dataset.cite) {
+      e.preventDefault();
+      const n = Number(cite.dataset.cite);
+      const ref = references.find((r) => r.n === n);
+      if (ref) jumpTo(ref.chunkId);
     }
   }
 
@@ -1612,7 +1698,7 @@
   // Graph view (Phase 4 visual): the selected entity's neighbourhood laid out as a node-link diagram,
   // and the entity list filtered by the search box.
   const entityLayout = $derived<GraphLayout | null>(
-    entityGraph ? layoutEntityGraph(entityGraph) : null
+    entityGraph ? applyOverrides(layoutEntityGraph(entityGraph), nodeOverrides) : null
   );
   const filteredEntities = $derived(
     entityQuery.trim()
@@ -1838,10 +1924,8 @@
           {@const rec = recommendModel(!!gpu?.ok)}
           <div class="gpu-bar" class:warn={!gpu?.ok}>
             {#if gpu?.ok}
-              <span title="WebGPU per-buffer cap is a Chrome limit, not your VRAM"
-                >🖥 GPU: {gpu.vendor || 'WebGPU'}{gpu.arch ? ` (${gpu.arch})` : ''} · ~{gpu.maxBufferGB.toFixed(
-                  1
-                )} GB/buffer</span
+              <span title="On-device GPU detected — local chat runs here"
+                >🖥 GPU: {gpu.vendor || 'WebGPU'}{gpu.arch ? ` (${gpu.arch})` : ''}</span
               >
               {#if loadPhase}
                 <span class="loading-model">
@@ -2000,23 +2084,17 @@
         {#if answer}
           <div class="answer">
             <div class="block-h">Answer</div>
-            {#if woven.length}
-              <p>
-                {#each woven as seg, i (i)}
-                  {@const link = seg.link}
-                  {#if link}
-                    <button
-                      class="wikilink"
-                      onclick={() => showSource(link.docId)}
-                      onmouseenter={(e) => showPreview(e, link.docId)}
-                      onmouseleave={hidePreview}>{seg.text}</button
-                    >
-                  {:else}{seg.text}{/if}
-                {/each}
-              </p>
-            {:else}
-              <p>{answer}</p>
-            {/if}
+            <!-- Rendered as safe Markdown (FR-CHAT-001, ADR-016): headings/lists/bold/tables format
+                 properly instead of raw text; [#n] citations are clickable Magic Jumps. -->
+            <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+            <article
+              class="answer-body md"
+              onclick={onRenderedClick}
+              onkeydown={(e) => e.key === 'Enter' && onRenderedClick(e as unknown as MouseEvent)}
+              role="document"
+            >
+              {@html answerHtml}
+            </article>
             {#if references.length}
               <div class="references">
                 <div class="block-h">
@@ -2028,6 +2106,8 @@
                     class="reference"
                     class:cited
                     onclick={() => jumpTo(r.chunkId)}
+                    onmouseenter={(e) => showPreview(e, r.docId)}
+                    onmouseleave={hidePreview}
                     title="Open this note"
                   >
                     <span class="ref-n">[{r.n}]</span>
@@ -2403,48 +2483,60 @@
                 <button class="back" onclick={closeEntity}>✕ close</button>
               </div>
               {#if entityLayout.nodes.length > 1}
+                <div class="graph-hint">drag nodes · drag canvas to pan · scroll to zoom</div>
+                <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
                 <svg
+                  bind:this={svgEl}
                   class="entity-graph"
+                  class:grabbing={drag !== null}
                   viewBox="0 0 {entityLayout.width} {entityLayout.height}"
                   role="img"
                   aria-label="Entity relationship graph for {selectedEntity.name}"
+                  onpointerdown={onGraphPointerDown}
+                  onpointermove={onGraphPointerMove}
+                  onpointerup={onGraphPointerUp}
+                  onpointercancel={onGraphPointerUp}
+                  onwheel={onGraphWheel}
                 >
-                  {#each entityLayout.edges as e (e.from + '|' + e.to + '|' + e.label)}
-                    <line
-                      x1={e.x1}
-                      y1={e.y1}
-                      x2={e.x2}
-                      y2={e.y2}
-                      stroke="#c9c2e6"
-                      stroke-width="1.5"
-                    />
-                    <text x={e.mx} y={e.my} class="edge-label" text-anchor="middle"
-                      >{e.label.replace(/_/g, ' ')}</text
-                    >
-                  {/each}
-                  {#each entityLayout.nodes as n (n.id)}
-                    <!-- svelte-ignore a11y_click_events_have_key_events -->
-                    <g
-                      class="g-node"
-                      class:center={n.hop === 0}
-                      role="button"
-                      tabindex="0"
-                      onclick={() => n.hop !== 0 && openEntityById(n.id)}
-                      onkeydown={(ev) => ev.key === 'Enter' && n.hop !== 0 && openEntityById(n.id)}
-                    >
-                      <circle
-                        cx={n.x}
-                        cy={n.y}
-                        r={n.r}
-                        fill={entityColor(n.type)}
-                        stroke="#fff"
-                        stroke-width="2"
+                  <g transform="translate({graphView.tx} {graphView.ty}) scale({graphView.scale})">
+                    {#each entityLayout.edges as e (e.from + '|' + e.to + '|' + e.label)}
+                      <line
+                        x1={e.x1}
+                        y1={e.y1}
+                        x2={e.x2}
+                        y2={e.y2}
+                        stroke="#c9c2e6"
+                        stroke-width="1.5"
                       />
-                      <text x={n.x} y={n.y + n.r + 12} class="node-label" text-anchor="middle"
-                        >{n.label}</text
+                      <text x={e.mx} y={e.my} class="edge-label" text-anchor="middle"
+                        >{e.label.replace(/_/g, ' ')}</text
                       >
-                    </g>
-                  {/each}
+                    {/each}
+                    {#each entityLayout.nodes as n (n.id)}
+                      <!-- svelte-ignore a11y_click_events_have_key_events -->
+                      <g
+                        class="g-node"
+                        class:center={n.hop === 0}
+                        role="button"
+                        tabindex="0"
+                        onpointerdown={(ev) => onNodePointerDown(ev, n)}
+                        onkeydown={(ev) =>
+                          ev.key === 'Enter' && n.hop !== 0 && openEntityById(n.id)}
+                      >
+                        <circle
+                          cx={n.x}
+                          cy={n.y}
+                          r={n.r}
+                          fill={entityColor(n.type)}
+                          stroke="#fff"
+                          stroke-width="2"
+                        />
+                        <text x={n.x} y={n.y + n.r + 12} class="node-label" text-anchor="middle"
+                          >{n.label}</text
+                        >
+                      </g>
+                    {/each}
+                  </g>
                 </svg>
               {:else}
                 <div class="hint">
@@ -2748,7 +2840,7 @@
                     {:else}
                       {formatSize(m.sizeMB)}{#if needsOomAck(m.id)}<span
                           class="warn-badge"
-                          title="May exceed the WebGPU per-buffer cap on some GPUs">⚠</span
+                          title="Large model — a bigger one-time download and more VRAM">⬇</span
                         >{/if}
                     {/if}
                   </span>
@@ -3357,11 +3449,48 @@
     border-radius: 12px;
     padding: 0.8rem 0.9rem;
   }
-  .answer p {
-    margin: 0;
-    line-height: 1.5;
+  /* Rendered-Markdown answer (FR-CHAT-001). Content is {@html}, so inner tags need :global. */
+  .answer-body {
+    line-height: 1.55;
   }
-  .wikilink {
+  .answer-body :global(p) {
+    margin: 0.5rem 0;
+  }
+  .answer-body :global(p:first-child) {
+    margin-top: 0;
+  }
+  .answer-body :global(ul),
+  .answer-body :global(ol) {
+    margin: 0.4rem 0;
+    padding-left: 1.4rem;
+  }
+  .answer-body :global(li) {
+    margin: 0.15rem 0;
+  }
+  .answer-body :global(h1),
+  .answer-body :global(h2),
+  .answer-body :global(h3) {
+    margin: 0.7rem 0 0.3rem;
+    font-size: 1.02rem;
+  }
+  .answer-body :global(code) {
+    background: #f3f1fa;
+    border-radius: 4px;
+    padding: 0.05rem 0.3rem;
+    font-size: 0.92em;
+  }
+  .answer-body :global(pre) {
+    background: #f3f1fa;
+    border-radius: 8px;
+    padding: 0.6rem 0.7rem;
+    overflow-x: auto;
+  }
+  .answer-body :global(pre code) {
+    background: none;
+    padding: 0;
+  }
+  .answer-body :global(.cite),
+  .answer-body :global(.wikilink) {
     cursor: pointer;
     border: 0;
     background: none;
@@ -3369,6 +3498,11 @@
     color: #6750a4;
     font: inherit;
     text-decoration: underline dotted;
+  }
+  .answer-body :global(.cite) {
+    font-size: 0.85em;
+    vertical-align: super;
+    line-height: 0;
   }
   .references {
     margin-top: 0.8rem;
@@ -3864,12 +3998,22 @@
     border: 1px solid #ececf2;
     border-radius: 10px;
     margin-bottom: 0.7rem;
+    cursor: grab;
+    touch-action: none; /* let pointer drag/pan work on touch instead of scrolling the page */
+  }
+  .entity-graph.grabbing {
+    cursor: grabbing;
+  }
+  .graph-hint {
+    font-size: 0.72rem;
+    color: #9a93b3;
+    margin: 0 0 0.3rem;
   }
   .g-node {
-    cursor: pointer;
+    cursor: grab;
   }
   .g-node.center {
-    cursor: default;
+    cursor: grab;
   }
   .g-node:focus-visible {
     outline: none;
