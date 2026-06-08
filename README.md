@@ -34,6 +34,28 @@ The full RAG pipeline runs end-to-end **in a real Chrome tab** on a real GPU —
 
 See [`BUILD-PROGRESS.md`](BUILD-PROGRESS.md) for the slice-by-slice log and [`docs/`](docs/) for the full spec set.
 
+## What you can do with it
+
+Drop a folder of notes and Nebula turns it into a **queryable knowledge graph** you can reason over — offline, in the browser.
+
+### 🧠 A "company brain" your team can interrogate
+
+Point it at your org's notes — people, projects, clients, incidents, decisions — and click **✨ build graph**. The on-device LLM reads every note and extracts the entities **and how they connect**. On a 16-note test vault it pulled out **29 entities** (people, projects, clients, products, teams), ranked by how many notes mention them, then let you click any one to see its 2-hop neighbourhood (e.g. *Marcus Chen → 22 connected entities*, with typed relations like *"Atlas Migration **caused** Atlas incident"*). Then ask a connected question:
+
+> *"What happened in the Atlas incident, who was involved, and what was the follow-up?"*
+
+Plain vector search returns the **2** notes whose wording matches. **GraphRAG adds 5 more** — the people in the escalation chain, the project that caused it, and the security work that followed — surfaced because they're *connected through shared entities*, even though their cosine score (0.21–0.26) sits **below** the relevance floor that plain RAG would drop them at. The answer then synthesises across **7 notes** and cites each. That's retrieval by **connection**, not just by **wording** — the structural context plain RAG misses.
+
+Great for onboarding (*"who owns what?"*), incident response (*"who do I loop in?"*), and impact analysis (*"everything that touches Acme Corp"*).
+
+### 🔒 A private research vault
+
+Thousands of PDFs and notes you can't or won't upload — contracts, papers, source code, journals. Ask in plain language, get cited answers offline, and when you want a frontier model, **Compile Context** hands Claude/GPT a token-counted, redactable slice instead of the raw files.
+
+### 🧑‍💼 A multi-client consultant's vault
+
+One vault, many clients. **Scope** a question to a folder or tag so answers never bleed across clients, then compile a per-client context block to share — with a provable no-cross-client-leak guarantee.
+
 ## Quick start — it runs in your browser
 
 ```bash
