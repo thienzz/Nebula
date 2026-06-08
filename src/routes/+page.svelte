@@ -1136,7 +1136,12 @@
   async function ensureModelLoaded(id: string): Promise<boolean> {
     if (!pipe) return false;
     if (loadedModel === id) return true;
-    if (needsOomAck(id) && !ackedModels.has(id)) {
+    const cached = await pipe.provider.isCached(id).catch(() => false);
+    // The large-model confirm is about a big ONE-TIME DOWNLOAD — so only ask when there's actually a
+    // download. A cached model loads instantly with no transfer, so never re-prompt for it (that's why
+    // the dialog kept reappearing on every reload: ackedModels resets in memory, and the check ignored
+    // the cache). Picking a large model in the gate still counts as the ack for the first download.
+    if (!cached && needsOomAck(id) && !ackedModels.has(id)) {
       const m = modelById(id);
       const ok = confirm(
         `${m?.label} is a large model — about ${formatSize(m?.sizeMB ?? 0)} to download once ` +
@@ -1149,7 +1154,7 @@
       }
       ackedModels = new Set(ackedModels).add(id);
     }
-    modelCached = await pipe.provider.isCached(id).catch(() => false);
+    modelCached = cached;
     loadPhase = modelCached ? 'loading' : 'downloading';
     loadPct = 0;
     status = `${modelCached ? 'loading cached model' : 'first run — downloading model once'}…`;
