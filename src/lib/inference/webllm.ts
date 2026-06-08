@@ -14,13 +14,16 @@ import {
 
 const MAX_CONTEXT_TOKENS = 4096;
 
-// Persist model weights in WebLLM's default Cache Storage (ADR-025, supersedes ADR-020's
-// IndexedDB choice). Live evidence: a 695 MB chat model survived many sessions in `webllm/model`
-// Cache Storage on the fixed-port origin — persistence was never the cache *backend*, it was the
-// origin (a changing dev-server port orphaned the cache; `strictPort: 1420` fixes that, and the
-// packaged Tauri app has a stable origin). Forcing IndexedDB would orphan that Cache-Storage copy
-// and trigger one needless re-download. So we keep the default and rely on the stable origin.
-const APP_CONFIG: webllm.AppConfig = webllm.prebuiltAppConfig;
+// Persist model weights via WebLLM's IndexedDB cache backend, NOT the default Cache Storage API
+// (supersedes ADR-025). ROOT CAUSE (isolated by live diagnosis): the app is crossOriginIsolated
+// (COEP), and HuggingFace now serves model shards through its xet CDN WITHOUT a
+// `Cross-Origin-Resource-Policy` header. Under COEP a cross-origin response lacking CORP can be
+// fetched+read (verified: GET 200, 155 MB body readable) but CANNOT be stored via the Cache API —
+// `Cache.add()/put()` throw "encountered a network error". WebLLM's default "cache" backend uses
+// exactly that path, so EVERY model download failed. The "indexeddb" backend instead stores the
+// fetched ArrayBuffers itself (no Response object hits the Cache API), sidestepping the CORP check
+// entirely. Persistence is equivalent (IndexedDB on the stable strictPort origin).
+const APP_CONFIG: webllm.AppConfig = { ...webllm.prebuiltAppConfig, cacheBackend: 'indexeddb' };
 
 export class WebLLMProvider implements InferenceProvider {
   readonly id = 'webllm' as const;
@@ -114,6 +117,22 @@ export class WebLLMProvider implements InferenceProvider {
       ttftMs,
       tokensPerSec: tokens / seconds
     };
+  }
+
+  /**
+   * Raw, non-streamed completion (TextGenerator seam) for auto-tagging + entity extraction. Not
+   * grounded and not cited — these are background "archivist" tasks, so temperature is 0 for stable,
+   * parseable JSON. Throws if no model is loaded; callers treat that as "skip, try later".
+   */
+  async complete(prompt: string, opts: { maxTokens?: number } = {}): Promise<string> {
+    if (!this.engine) throw new Error('Model not loaded');
+    const res = await this.engine.chat.completions.create({
+      stream: false,
+      temperature: 0,
+      max_tokens: opts.maxTokens ?? 512,
+      messages: [{ role: 'user', content: prompt }]
+    });
+    return res.choices[0]?.message?.content ?? '';
   }
 
   async unload(): Promise<void> {

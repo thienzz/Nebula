@@ -7,6 +7,9 @@ import { RecordId, Surreal } from 'surrealdb';
 import { surrealdbWasmEngines } from '@surrealdb/wasm';
 import { EMBEDDING_DIM } from '$lib/inference/provider';
 import type { SearchHit } from '$lib/inference/provider';
+import type { EntityRecord, MentionEdge, RelationEdge } from '$lib/graph/types';
+import type { GraphNeighbor } from '$lib/graph/entity-graph';
+import { fuseGraphRag } from '$lib/retrieval/graphrag';
 
 export interface ChunkRecord {
   chunkId: string;
@@ -43,6 +46,14 @@ export interface NoteRecord {
   frontmatter?: Record<string, unknown>;
 }
 
+/** The three rankings GraphRAG produces: vector seeds, graph-expanded chunks, and the fused set. */
+export interface GraphRagResult {
+  seeds: SearchHit[]; // pure vector top-K (semantic)
+  expanded: SearchHit[]; // sibling chunks reached via shared entities (structural)
+  fused: SearchHit[]; // the final, RRF-fused context fed to the LLM
+  entityIds: string[]; // the entities the seeds mention (what the expansion hung off)
+}
+
 export class VectorStore {
   private db: Surreal | null = null;
 
@@ -58,7 +69,11 @@ export class VectorStore {
     await db.query(
       `DEFINE TABLE IF NOT EXISTS chunk SCHEMALESS;
        DEFINE INDEX IF NOT EXISTS hnsw_idx ON chunk FIELDS embedding HNSW DIMENSION ${dimension} DIST COSINE;
-       DEFINE TABLE IF NOT EXISTS note SCHEMALESS;`
+       DEFINE TABLE IF NOT EXISTS note SCHEMALESS;
+       DEFINE TABLE IF NOT EXISTS entity SCHEMALESS;
+       DEFINE TABLE IF NOT EXISTS mentions SCHEMALESS;
+       DEFINE TABLE IF NOT EXISTS relates SCHEMALESS;
+       DEFINE TABLE IF NOT EXISTS graphmeta SCHEMALESS;`
     );
     this.db = db;
   }
@@ -68,13 +83,40 @@ export class VectorStore {
     return this.db;
   }
 
+  // Serialize EVERY statement through one promise chain (+ retry transient errors). The IndexedDB-
+  // backed engine throws "Can not open transaction" when a read and a write overlap on the same
+  // connection — which is exactly what happened under bulk ingest (a fire-and-forget entity-pane
+  // refresh racing the next note's writes), wedging the connection so all further writes failed.
+  // Funnelling every query here guarantees strictly one-at-a-time access, with a short backoff retry.
+  private chain: Promise<unknown> = Promise.resolve();
+  private q<T>(sql: string, vars?: Record<string, unknown>): Promise<T> {
+    const exec = async (): Promise<T> => {
+      const db = this.conn;
+      for (let attempt = 0; ; attempt++) {
+        try {
+          return (await db.query(sql, vars)) as T;
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          if (attempt >= 4 || !/transaction|lock|busy|conflict/i.test(msg)) throw e;
+          await new Promise((r) => setTimeout(r, 25 * (attempt + 1)));
+        }
+      }
+    };
+    const result = this.chain.then(exec, exec);
+    this.chain = result.then(
+      () => undefined,
+      () => undefined
+    );
+    return result;
+  }
+
   /**
    * Upsert chunks keyed by a stable record id (= chunkId), so re-ingesting a document
    * overwrites rather than duplicating (FR-ING-007 — chunks keyed by (document, seq)).
    */
   async upsertChunks(records: ChunkRecord[]): Promise<void> {
     for (const r of records) {
-      await this.conn.query(
+      await this.q(
         'UPSERT type::thing("chunk", $cid) CONTENT { chunkId: $cid, docId: $docId, text: $text, page: $page, charStart: $cs, charEnd: $ce, embedding: $emb }',
         {
           cid: r.chunkId,
@@ -92,7 +134,7 @@ export class VectorStore {
   /** Cosine top-K KNN over the HNSW index (FR-RET-001). Returns hits in descending score. */
   async search(queryVec: number[], k = 8): Promise<SearchHit[]> {
     const topK = Math.max(1, Math.floor(k));
-    const [rows] = await this.conn.query<[ChunkRow[]]>(
+    const [rows] = await this.q<[ChunkRow[]]>(
       `SELECT chunkId, docId, text, page, charStart, charEnd, vector::distance::knn() AS dist
        FROM chunk WHERE embedding <|${topK},COSINE|> $q ORDER BY dist`,
       { q: queryVec }
@@ -110,7 +152,16 @@ export class VectorStore {
 
   /** Remove all chunks for a document (re-index / delete — FR-DATA-002/003). */
   async deleteDoc(docId: string): Promise<void> {
-    await this.conn.query('DELETE chunk WHERE docId = $docId', { docId });
+    await this.q('DELETE chunk WHERE docId = $docId', { docId });
+  }
+
+  /** A document's chunk ids + text — used to attach entity mentions to the chunk that names them. */
+  async chunkTextsForDoc(docId: string): Promise<{ chunkId: string; text: string }[]> {
+    const [rows] = await this.q<[{ chunkId: string; text: string }[]]>(
+      'SELECT chunkId, text FROM chunk WHERE docId = $docId',
+      { docId }
+    );
+    return rows ?? [];
   }
 
   /**
@@ -118,7 +169,7 @@ export class VectorStore {
    * This is what makes hand-written notes survive a refresh in the browser build (no `.md` on disk).
    */
   async upsertNote(note: NoteRecord): Promise<void> {
-    await this.conn.query(
+    await this.q(
       'UPSERT type::thing("note", $id) CONTENT { docId: $id, title: $title, body: $body, aliases: $aliases, kind: $kind, sourcePath: $sourcePath, frontmatter: $fm }',
       {
         id: note.docId,
@@ -134,7 +185,7 @@ export class VectorStore {
 
   /** All persisted notes (the vault), for rehydrating on startup. */
   async allNotes(): Promise<NoteRecord[]> {
-    const [rows] = await this.conn.query<
+    const [rows] = await this.q<
       [
         {
           docId: string;
@@ -160,7 +211,7 @@ export class VectorStore {
 
   /** Forget a persisted note (FR-NOTE-009). Its chunks are dropped separately via deleteDoc. */
   async deleteNote(docId: string): Promise<void> {
-    await this.conn.query('DELETE type::thing("note", $id)', { id: docId });
+    await this.q('DELETE type::thing("note", $id)', { id: docId });
   }
 
   /**
@@ -176,7 +227,7 @@ export class VectorStore {
     await this.clearRetrieval(queryId);
     const q = new RecordId('query', queryId);
     for (let i = 0; i < hits.length; i++) {
-      await this.conn.query('RELATE $q->retrieved_from->$c SET score = $score, rank = $rank', {
+      await this.q('RELATE $q->retrieved_from->$c SET score = $score, rank = $rank', {
         q,
         c: new RecordId('chunk', hits[i].chunkId),
         score: hits[i].score,
@@ -189,7 +240,7 @@ export class VectorStore {
   async getRetrievalSubgraph(
     queryId: string
   ): Promise<{ chunkId: string; docId: string; score: number; rank: number }[]> {
-    const [rows] = await this.conn.query<
+    const [rows] = await this.q<
       [{ chunkId: string; docId: string; score: number; rank: number }[]]
     >(
       `SELECT out.chunkId AS chunkId, out.docId AS docId, score, rank
@@ -201,16 +252,256 @@ export class VectorStore {
 
   /** Drop a query's edges — the Micro-Map is ephemeral per conversation turn (FR-GRAPH-002). */
   async clearRetrieval(queryId: string): Promise<void> {
-    await this.conn.query('DELETE retrieved_from WHERE in = $q', {
+    await this.q('DELETE retrieved_from WHERE in = $q', {
       q: new RecordId('query', queryId)
     });
   }
 
   async count(): Promise<number> {
-    const [rows] = await this.conn.query<[{ c: number }[]]>(
+    const [rows] = await this.q<[{ c: number }[]]>(
       'SELECT count() AS c FROM chunk GROUP ALL'
     );
     return rows?.[0]?.c ?? 0;
+  }
+
+  // ── Knowledge graph (entities, mentions, relations) ──────────────────────────────────────────
+  // Entities + their edges are PERSISTED (extraction is an expensive LLM pass — see graph/entities.ts)
+  // so multi-hop traversal and GraphRAG work across sessions without re-reading the vault. Every edge
+  // carries the `docId` that asserted it, for provenance (verifiable answers) and scoped cleanup.
+
+  /** Upsert an entity node keyed by its canonical id (idempotent; last write wins on name/aliases). */
+  async upsertEntity(e: EntityRecord): Promise<void> {
+    await this.q(
+      'UPSERT type::thing("entity", $id) CONTENT { entityId: $id, name: $name, type: $type, aliases: $aliases }',
+      { id: e.id, name: e.name, type: e.type, aliases: e.aliases ?? [] }
+    );
+  }
+
+  /** Record a chunk→entity mention edge, tagged with its doc (provenance + scoped cleanup). */
+  async relateMention(chunkId: string, docId: string, entityId: string): Promise<void> {
+    await this.q('RELATE $c->mentions->$e SET docId = $docId', {
+      c: new RecordId('chunk', chunkId),
+      e: new RecordId('entity', entityId),
+      docId
+    });
+  }
+
+  /** Record an entity→entity relation edge with its label + the doc that asserted it. */
+  async relateEntities(
+    sourceId: string,
+    targetId: string,
+    type: string,
+    docId: string
+  ): Promise<void> {
+    await this.q('RELATE $s->relates->$t SET type = $type, docId = $docId', {
+      s: new RecordId('entity', sourceId),
+      t: new RecordId('entity', targetId),
+      type,
+      docId
+    });
+  }
+
+  /**
+   * Drop a document's graph edges (re-ingest / delete). Entity NODES are left intact — they may be
+   * mentioned by other docs; orphaned ones (no remaining mentions) are simply filtered out of the
+   * index. Mirrors deleteDoc for chunks: the graph is a rebuildable cache over the `.md` truth.
+   */
+  async clearDocGraph(docId: string): Promise<void> {
+    await this.q(
+      'DELETE mentions WHERE docId = $docId; DELETE relates WHERE docId = $docId; DELETE graphmeta WHERE docId = $docId;',
+      { docId }
+    );
+  }
+
+  /**
+   * Incremental-extraction guard (perf): the content hash of the text last extracted into the graph
+   * for `docId`. A rebuild compares it to the current text and SKIPS the (expensive) LLM extraction
+   * when unchanged — so re-running "build graph" only re-reads notes that actually changed, turning a
+   * minutes-long full pass into a near-instant no-op. Returns null when the doc was never extracted.
+   */
+  async getGraphHash(docId: string): Promise<string | null> {
+    const [rows] = await this.q<[{ hash: string }[]]>(
+      'SELECT hash FROM graphmeta WHERE docId = $docId',
+      { docId }
+    );
+    return rows?.[0]?.hash ?? null;
+  }
+
+  /** Record the content hash extracted for a doc (set after a successful extraction). */
+  async setGraphHash(docId: string, hash: string): Promise<void> {
+    await this.q(
+      'UPSERT type::thing("graphmeta", $id) CONTENT { docId: $id, hash: $hash }',
+      { id: docId, hash }
+    );
+  }
+
+  /** All entity nodes (for the entities pane / pure index builders). */
+  async allEntities(): Promise<EntityRecord[]> {
+    const [rows] = await this.q<
+      [{ id: string; name: string; type: string; aliases: string[] | null }[]]
+    >('SELECT entityId AS id, name, type, aliases FROM entity');
+    return (rows ?? []).map((r) => ({
+      id: r.id,
+      name: r.name,
+      type: r.type,
+      aliases: r.aliases ?? []
+    }));
+  }
+
+  /** All mention edges as flat {docId, chunkId, entityId} rows (for the pure index builders). */
+  async allMentions(): Promise<MentionEdge[]> {
+    const [rows] = await this.q<
+      [{ docId: string; chunkId: string; entityId: string }[]]
+    >('SELECT docId, in.chunkId AS chunkId, out.entityId AS entityId FROM mentions');
+    return (rows ?? []).filter((r) => r.chunkId && r.entityId);
+  }
+
+  /** All relation edges as flat {sourceId, targetId, type, docId} rows. */
+  async allRelations(): Promise<RelationEdge[]> {
+    const [rows] = await this.q<
+      [{ sourceId: string; targetId: string; type: string; docId: string | null }[]]
+    >('SELECT in.entityId AS sourceId, out.entityId AS targetId, type, docId FROM relates');
+    return (rows ?? [])
+      .filter((r) => r.sourceId && r.targetId)
+      .map((r) => ({ sourceId: r.sourceId, targetId: r.targetId, type: r.type, docId: r.docId ?? undefined }));
+  }
+
+  /** The distinct docIds that mention an entity (its provenance / "backlinks"). */
+  async mentionsForEntity(entityId: string): Promise<{ docId: string; chunkId: string }[]> {
+    const [rows] = await this.q<[{ docId: string; chunkId: string }[]]>(
+      'SELECT docId, in.chunkId AS chunkId FROM mentions WHERE out = $e',
+      { e: new RecordId('entity', entityId) }
+    );
+    return (rows ?? []).filter((r) => r.chunkId);
+  }
+
+  /** Distinct entity ids mentioned by any of the given chunks (the seeds' entities). */
+  async entityIdsForChunks(chunkIds: string[]): Promise<string[]> {
+    if (chunkIds.length === 0) return [];
+    const [rows] = await this.q<[{ entityId: string }[]]>(
+      'SELECT out.entityId AS entityId FROM mentions WHERE in IN $chunks',
+      { chunks: chunkIds.map((id) => new RecordId('chunk', id)) }
+    );
+    const seen = new Set<string>();
+    for (const r of rows ?? []) if (r.entityId) seen.add(r.entityId);
+    return [...seen];
+  }
+
+  /** 1-hop neighbours of an entity over `relates`, BOTH directions, with names + relation labels. */
+  private async neighbors1(
+    entityId: string
+  ): Promise<{ id: string; name: string; type: string }[]> {
+    const e = new RecordId('entity', entityId);
+    const [outRows] = await this.q<[{ id: string; name: string; type: string }[]]>(
+      'SELECT out.entityId AS id, out.name AS name, out.type AS type FROM relates WHERE in = $e',
+      { e }
+    );
+    const [inRows] = await this.q<[{ id: string; name: string; type: string }[]]>(
+      'SELECT in.entityId AS id, in.name AS name, in.type AS type FROM relates WHERE out = $e',
+      { e }
+    );
+    return [...(outRows ?? []), ...(inRows ?? [])].filter((r) => r.id);
+  }
+
+  /**
+   * Multi-hop traversal over the PERSISTENT entity graph (FR-GRAPH, the graph-DB justification):
+   * breadth-first from `entityId` up to `hops`, returning each reachable entity with its hop
+   * distance. This is the "everyone connected to Acme within 2 hops" query — the thing that's
+   * painful over an in-memory recompute but native to a persisted graph. Capped at `maxNodes`.
+   */
+  async entityNeighbors(entityId: string, hops = 2, maxNodes = 50): Promise<GraphNeighbor[]> {
+    const visited = new Set<string>([entityId]);
+    const result: GraphNeighbor[] = [];
+    let frontier = [entityId];
+    for (let hop = 1; hop <= hops && frontier.length; hop++) {
+      const next: string[] = [];
+      for (const node of frontier) {
+        for (const n of await this.neighbors1(node)) {
+          if (visited.has(n.id)) continue;
+          visited.add(n.id);
+          result.push({ id: n.id, name: n.name, type: n.type, hop });
+          next.push(n.id);
+          if (result.length >= maxNodes) return result;
+        }
+      }
+      frontier = next;
+    }
+    return result;
+  }
+
+  /** Relation edges whose BOTH endpoints are in `entityIds` (for rendering an entity sub-graph). */
+  async relationsAmong(entityIds: string[]): Promise<RelationEdge[]> {
+    if (entityIds.length === 0) return [];
+    const ents = entityIds.map((id) => new RecordId('entity', id));
+    const [rows] = await this.q<
+      [{ sourceId: string; targetId: string; type: string }[]]
+    >(
+      'SELECT in.entityId AS sourceId, out.entityId AS targetId, type FROM relates WHERE in IN $ents AND out IN $ents',
+      { ents }
+    );
+    return (rows ?? []).filter((r) => r.sourceId && r.targetId);
+  }
+
+  /**
+   * GraphRAG retrieval (Phase 3) — the multi-model payoff: vector + graph in one engine. Vector
+   * search finds semantic seeds; their entities pull in sibling chunks (structurally relevant
+   * context the vector pass ranked low or missed); the two are RRF-fused (graph/graphrag.ts). When
+   * the vault has no graph yet this degrades to plain vector order, so it never loses recall.
+   */
+  async graphRagSearch(
+    queryVec: number[],
+    opts: { seedK?: number; expandK?: number; k?: number } = {}
+  ): Promise<GraphRagResult> {
+    const seedK = opts.seedK ?? 8;
+    const expandK = opts.expandK ?? 8;
+    const k = opts.k ?? 8;
+
+    const seeds = await this.search(queryVec, seedK);
+    const seedChunkIds = new Set(seeds.map((h) => h.chunkId));
+    const entityIds = await this.entityIdsForChunks([...seedChunkIds]);
+    if (entityIds.length === 0) {
+      return { seeds, expanded: [], fused: seeds.slice(0, k), entityIds: [] };
+    }
+
+    // Sibling chunks mentioning the seed entities, scored vs the query in-DB (one row per mention).
+    const ents = entityIds.map((id) => new RecordId('entity', id));
+    const [rows] = await this.q<[(ChunkRow & { chunkId: string })[]]>(
+      `SELECT in.chunkId AS chunkId, in.docId AS docId, in.text AS text, in.page AS page,
+              in.charStart AS charStart, in.charEnd AS charEnd,
+              vector::similarity::cosine(in.embedding, $q) AS dist
+       FROM mentions WHERE out IN $ents`,
+      { q: queryVec, ents }
+    );
+
+    // Aggregate to one hit per sibling chunk, counting shared entities = graph proximity.
+    const byChunk = new Map<string, { hit: SearchHit; shared: number }>();
+    for (const r of rows ?? []) {
+      if (!r.chunkId || seedChunkIds.has(r.chunkId)) continue; // drop seeds — they're the vector side
+      const existing = byChunk.get(r.chunkId);
+      if (existing) {
+        existing.shared += 1;
+      } else {
+        byChunk.set(r.chunkId, {
+          shared: 1,
+          hit: {
+            chunkId: r.chunkId,
+            docId: r.docId,
+            text: r.text,
+            page: r.page ?? undefined,
+            charStart: r.charStart,
+            charEnd: r.charEnd,
+            score: r.dist // already a cosine SIMILARITY here (vector::similarity::cosine), not a distance
+          }
+        });
+      }
+    }
+    const expanded = [...byChunk.values()]
+      .sort((a, b) => b.shared - a.shared || b.hit.score - a.hit.score)
+      .slice(0, expandK)
+      .map((x) => x.hit);
+
+    const fused = fuseGraphRag(seeds, expanded, { k });
+    return { seeds, expanded, fused, entityIds };
   }
 
   async close(): Promise<void> {

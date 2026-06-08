@@ -42,6 +42,10 @@ export interface InferenceProvider {
     onToken: (t: string) => void,
     signal: AbortSignal
   ): Promise<GenerateResult>;
+  // Raw (ungrounded) completion seam for non-RAG tasks — auto-tagging (FR-ING-006) and entity/
+  // relation extraction (knowledge graph). Optional: a provider that only does grounded generation
+  // may omit it, and callers degrade gracefully (the graph/tags are best-effort, never a hard fail).
+  complete?(prompt: string, opts?: { maxTokens?: number; signal?: AbortSignal }): Promise<string>;
   unload(): Promise<void>;
 }
 

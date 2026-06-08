@@ -10,6 +10,13 @@
   import type { NoteRecord } from '$lib/db/store';
   import { buildTitleIndex, weaveLinks, notePreview, type WovenSegment } from '$lib/weave/weaver';
   import { buildMicroGraph, type MicroGraph } from '$lib/graph/micrograph';
+  import { selectGraphRagContext } from '$lib/retrieval/graphrag';
+  import { extractEntities } from '$lib/graph/entities';
+  import { resolveExtraction } from '$lib/graph/resolve';
+  import { buildEntityIndex, type EntityEntry } from '$lib/graph/entity-index';
+  import { buildEntityGraph, type EntityGraph, type GraphNeighbor } from '$lib/graph/entity-graph';
+  import type { EntityRecord, MentionEdge, RelationEdge } from '$lib/graph/types';
+  import type { TextGenerator } from '$lib/ingest/autotag';
   import { resolveCitationTarget, buildHighlightSegments } from '$lib/chat/citation';
   import { exportVaultZip } from '$lib/vault/export';
   import { intake } from '$lib/ingest/intake';
@@ -185,6 +192,19 @@
   // makes it feel like an assistant, not a search box); 'grounded' = strict, notes-only, verifiable.
   let answerMode = $state<'grounded' | 'reason'>('reason');
 
+  // Knowledge graph (Phases 1–4). GraphRAG fuses vector seeds with graph-connected siblings — the
+  // lever for the local-LLM quality ceiling. The Entities pane + entity page navigate the persisted
+  // graph; the entity graph view is the multi-hop "how is X connected to Y" map.
+  let graphRagOn = $state(true); // use GraphRAG when the vault has a graph (degrades to plain RAG)
+  let graphInfo = $state(''); // e.g. "+3 graph-connected" — shows GraphRAG actually expanded context
+  let graphExpandedIds = $state(new Set<string>()); // chunkIds that entered via graph expansion (badge)
+  let entityIndex = $state<EntityEntry[]>([]); // the Entities pane (built from persisted edges)
+  let entityRelations = $state<RelationEdge[]>([]); // all relations, for the entity graph view
+  let selectedEntity = $state<EntityEntry | null>(null); // open entity page
+  let entityGraph = $state<EntityGraph | null>(null); // multi-hop sub-graph for the selected entity
+  let entityNotes = $state<string[]>([]); // docIds mentioning the selected entity
+  let graphBusy = $state(false);
+
   // Context Compiler UI (FR-CTX-*) — compact, token-counted share to another LLM.
   const COMPILE_MODELS = ['gpt-4o', 'gpt-4', 'claude-sonnet', 'claude-opus'];
   let compileOpen = $state(false);
@@ -211,9 +231,31 @@
     removeDoc: (docId: string) => Promise<void>;
     putNote: (note: NoteRecord) => Promise<void>;
     forgetNote: (docId: string) => Promise<void>;
+    // Knowledge graph (entities + relations): GraphRAG retrieval, ingest-time extraction, and
+    // navigation/traversal over the persisted graph (Phases 1–4).
+    graphRag: (
+      v: number[],
+      opts: { seedK: number; expandK: number; k: number }
+    ) => Promise<{
+      seeds: SearchHit[];
+      expanded: SearchHit[];
+      fused: SearchHit[];
+      entityIds: string[];
+    }>;
+    indexGraph: (docId: string, text: string) => Promise<number>;
+    clearGraph: (docId: string) => Promise<void>;
+    entityData: () => Promise<{
+      entities: EntityRecord[];
+      mentions: MentionEdge[];
+      relations: RelationEdge[];
+    }>;
+    entityNeighbors: (id: string, hops: number) => Promise<GraphNeighbor[]>;
+    relationsAmong: (ids: string[]) => Promise<RelationEdge[]>;
+    mentionsForEntity: (id: string) => Promise<{ docId: string; chunkId: string }[]>;
     provider: {
       isCached: (m: string) => Promise<boolean>;
       loadModel: (m: string, cb: (p: number) => void) => Promise<void>;
+      complete?: (p: string, o?: { maxTokens?: number }) => Promise<string>;
       generate: (
         req: {
           requestId: string;
@@ -235,6 +277,17 @@
   } | null = null;
   let loadedModel = $state('');
 
+  // Cheap, stable content hash (FNV-1a) for the incremental-extraction guard: if a note's text hasn't
+  // changed since its last graph extraction, skip the expensive LLM pass entirely (perf).
+  function graphHash(text: string): string {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < text.length; i++) {
+      h ^= text.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    return (h >>> 0).toString(16);
+  }
+
   onMount(async () => {
     coi = crossOriginIsolated;
     // Probe WebGPU once at startup (FR-CAP-001, ADR-030): is chat possible, on what GPU, and what is
@@ -253,6 +306,13 @@
       }
     } catch {
       /* no WebGPU → chat unsupported; semantic search still works (FR-CAP-002) */
+    }
+    // Default to the GPU-recommended model (Qwen2.5-3B — multilingual, far better entity/relation
+    // extraction than the tiny 1B) when WebGPU is present. Auto-preload only fires if it's already
+    // cached, so this never triggers a surprise multi-GB download — the first Ask/build does.
+    {
+      const rec = recommendModel(!!gpu?.ok);
+      if (rec) modelId = rec.id;
     }
     const [{ createEmbedClient }, { VectorStore }, { WebLLMProvider }, { EMBEDDING_DIM }] =
       await Promise.all([
@@ -335,6 +395,46 @@
     }
 
     const provider = new WebLLMProvider();
+
+    // Ingest-time knowledge-graph extraction (Phase 1). Best-effort, exactly like auto-tagging: with
+    // no chat model loaded there's nothing to extract WITH, so skip — chunks/embeddings (and thus
+    // plain RAG) are unaffected. With a model loaded, skim → extract → resolve → persist with
+    // chunk-level provenance so GraphRAG can later expand on shared entities.
+    const indexGraph = async (docId: string, text: string): Promise<number> => {
+      const gen: TextGenerator | null =
+        loadedModel && provider.complete ? (p, o) => provider.complete(p, o) : null;
+      if (!gen) return 0;
+      // Incremental guard (perf): skip the LLM extraction when this exact text was already extracted.
+      // Turns a repeat "build graph" from a minutes-long full pass into re-reading only CHANGED notes.
+      const hash = graphHash(text);
+      if ((await store.getGraphHash(docId)) === hash) return -1; // -1 = skipped (unchanged)
+      const res = await extractEntities(text, gen);
+      if (!res.ok) return 0;
+      const g = resolveExtraction(res.extraction);
+      if (g.entities.length === 0) return 0;
+      await store.clearDocGraph(docId);
+      for (const e of g.entities) await store.upsertEntity(e);
+      // Attach each entity to the chunks whose text actually names it → chunk-level provenance, which
+      // is what lets GraphRAG pull the RIGHT sibling chunks (not the whole doc) on a shared entity.
+      const chunks = await store.chunkTextsForDoc(docId);
+      const lc = chunks.map((c) => ({ chunkId: c.chunkId, text: c.text.toLowerCase() }));
+      for (const e of g.entities) {
+        const surfaces = [e.name, ...e.aliases].map((s) => s.toLowerCase()).filter(Boolean);
+        for (const c of lc) {
+          if (surfaces.some((s) => c.text.includes(s)))
+            await store.relateMention(c.chunkId, docId, e.id);
+        }
+      }
+      // Quality gate: drop weak/guessed relations so the graph isn't polluted with low-signal edges
+      // (e.g. a tiny model labelling everything the same generic type). 0.5 is a forgiving floor.
+      for (const r of g.relations) {
+        if ((r.confidence ?? 1) < 0.5) continue;
+        await store.relateEntities(r.sourceId, r.targetId, r.type, docId);
+      }
+      await store.setGraphHash(docId, hash); // mark this text as extracted → next rebuild skips it
+      return g.entities.length;
+    };
+
     pipe = {
       embed: (t) => embedClient.embedQuery(t),
       search: (v, k) => store.search(v, k),
@@ -347,10 +447,22 @@
       removeDoc: (docId) => store.deleteDoc(docId),
       putNote: (note) => store.upsertNote(note),
       forgetNote: (docId) => store.deleteNote(docId),
+      graphRag: (v, opts) => store.graphRagSearch(v, opts),
+      indexGraph,
+      clearGraph: (docId) => store.clearDocGraph(docId),
+      entityData: async () => ({
+        entities: await store.allEntities(),
+        mentions: await store.allMentions(),
+        relations: await store.allRelations()
+      }),
+      entityNeighbors: (id, hops) => store.entityNeighbors(id, hops),
+      relationsAmong: (ids) => store.relationsAmong(ids),
+      mentionsForEntity: (id) => store.mentionsForEntity(id),
       provider
     };
     status = 'ready';
     ready = true;
+    void refreshEntities(); // populate the Entities pane from any graph persisted in a prior session
 
     // Auto-preload the selected model IF it's already cached (no download) so the first Ask is
     // instant (ADR-030). We never auto-DOWNLOAD a multi-GB model unasked — uncached models wait for
@@ -407,6 +519,8 @@
           taggableLater: !!sourcePath
         });
         await pipe.ingest(docId, body);
+        // Extract + persist this document's entity graph (best-effort; needs a loaded model).
+        const entCount = await pipe.indexGraph(docId, body).catch(() => 0);
         await pipe.putNote({
           docId,
           title: stem,
@@ -435,12 +549,16 @@
           ];
           await putSource(sourcePath, bytes); // persist the original so Export survives a refresh
         }
-        importMsg = `✓ ingested ${docId} (${res.type})`;
+        importMsg = `✓ ingested ${docId} (${res.type})${entCount > 0 ? ` · ${entCount} entities` : ''}`;
         showSource(docId);
       } catch (e) {
         importMsg = `error on ${file.name}: ${e instanceof Error ? e.message : String(e)}`;
       }
     }
+    // Refresh the Entities pane ONCE after the whole batch — never per-file. A fire-and-forget
+    // refresh inside the loop runs a READ that overlaps the next file's WRITES, which wedges the
+    // IndexedDB engine ("Can not open transaction") on large bulk ingests (FOUND via stress test).
+    await refreshEntities();
     if (fileInput) fileInput.value = '';
   }
 
@@ -486,10 +604,15 @@
     while (indexJobs.length) {
       const job = indexJobs[0];
       try {
-        if (job.oldDocId) await pipe.removeDoc(job.oldDocId);
+        if (job.oldDocId) {
+          await pipe.removeDoc(job.oldDocId);
+          await pipe.clearGraph(job.oldDocId);
+        }
         await pipe.ingest(job.docId, job.body, (done, total) => {
           bgProgress = total > EMBED_PROGRESS_MIN ? `${shortName(job.docId)} ${done}/${total}` : '';
         });
+        // Extract + persist the note's entity graph too (best-effort; needs a loaded model).
+        await pipe.indexGraph(job.docId, job.body);
       } catch {
         /* a failed index shouldn't wedge the queue; the note stays in the vault, just unindexed */
       }
@@ -498,6 +621,84 @@
       bgProgress = '';
     }
     indexRunning = false;
+    await refreshEntities(); // once, after the queue drains — never per-job (avoids the read/write race)
+  }
+
+  /** Rebuild the Entities pane from the persisted graph (after ingest / index / delete). Phase 2. */
+  async function refreshEntities() {
+    if (!pipe) return;
+    try {
+      const data = await pipe.entityData();
+      entityIndex = buildEntityIndex(data.entities, data.mentions);
+      entityRelations = data.relations;
+    } catch {
+      /* graph is best-effort; an empty pane is fine */
+    }
+  }
+
+  /** Open an entity page: its notes (mentions) + a multi-hop sub-graph over the persisted graph. */
+  async function openEntity(e: EntityEntry) {
+    if (!pipe) return;
+    selectedEntity = e;
+    graphBusy = true;
+    entityGraph = null;
+    entityNotes = [];
+    activeDoc = null;
+    try {
+      entityNotes = [...new Set((await pipe.mentionsForEntity(e.id)).map((m) => m.docId))].sort();
+      const neighbors = await pipe.entityNeighbors(e.id, 2); // 1–2 hops (Phase 4 traversal)
+      const ids = [e.id, ...neighbors.map((n) => n.id)];
+      const rels = await pipe.relationsAmong(ids);
+      entityGraph = buildEntityGraph(
+        { id: e.id, name: e.name, type: e.type },
+        neighbors,
+        rels.map((r) => ({ sourceId: r.sourceId, targetId: r.targetId, type: r.type }))
+      );
+    } finally {
+      graphBusy = false;
+    }
+  }
+  function closeEntity() {
+    selectedEntity = null;
+    entityGraph = null;
+    entityNotes = [];
+  }
+
+  /** Jump from a node in the entity graph to that entity's page (multi-hop browsing). */
+  function openEntityById(id: string) {
+    const e = entityIndex.find((x) => x.id === id);
+    if (e) {
+      void openEntity(e);
+      return;
+    }
+    const node = entityGraph?.nodes.find((n) => n.id === id);
+    if (node) void openEntity({ id, name: node.label, type: node.type ?? '', noteCount: 0, docIds: [] });
+  }
+
+  /** One-click: extract the entity graph across the whole vault (loads the model if needed). */
+  async function buildVaultGraph() {
+    if (!pipe || graphBusy) return;
+    if (!loadedModel) {
+      const ok = await ensureModelLoaded(modelId);
+      if (!ok) return;
+    }
+    graphBusy = true;
+    try {
+      let extracted = 0;
+      let skipped = 0;
+      for (const n of vault) {
+        status = `extracting entities: ${shortName(n.docId)}…`;
+        const r = await pipe.indexGraph(n.docId, n.text).catch(() => 0);
+        if (r === -1) skipped++;
+        else if (r > 0) extracted++;
+      }
+      await refreshEntities();
+      status =
+        `graph ready · ${entityIndex.length} entities · ${extracted} extracted` +
+        (skipped ? `, ${skipped} unchanged (skipped)` : '');
+    } finally {
+      graphBusy = false;
+    }
   }
 
   async function saveNote() {
@@ -591,6 +792,8 @@
     if (!confirm(`Delete ${docId}?\nThis removes it from the vault and the search index.`)) return;
     await pipe.removeDoc(docId);
     await pipe.forgetNote(docId); // drop the persisted note doc too, so it stays deleted after refresh
+    await pipe.clearGraph(docId); // and its entity-graph edges (entity nodes stay if other docs use them)
+    void refreshEntities();
     const gone = vault.find((n) => n.docId === docId);
     if (gone?.sourcePath) {
       originals = originals.filter((o) => o.path !== gone.sourcePath);
@@ -805,13 +1008,24 @@
       });
     } catch (err) {
       loadPhase = '';
-      const tooBig = modelById(id);
+      const m = modelById(id);
+      const msg = err instanceof Error ? err.message : String(err);
       modelId = loadedModel || DEFAULT_MODEL_ID;
-      const cap =
-        gpuBufferLimitGB > 0 ? `~${gpuBufferLimitGB.toFixed(1)} GB WebGPU buffer cap` : 'this GPU';
-      status =
-        `⚠ ${tooBig?.label ?? 'model'} couldn't load — it exceeds ${cap}. ` +
-        `Pick a smaller model. [${err instanceof Error ? err.message : err}]`;
+      // Distinguish a DOWNLOAD failure (network / HuggingFace 503 / Cache.add) from a real GPU OOM.
+      // The old code blamed every failure on the buffer cap — misleading during a host outage, where
+      // the right action is "retry" (cached shards resume), not "pick a smaller model".
+      const isDownload = /cache|network|fetch|failed to execute 'add'|http|50\d|429|timeout|load/i.test(
+        msg
+      );
+      if (isDownload) {
+        status =
+          `⚠ ${m?.label ?? 'model'} download didn't finish — the model host (HuggingFace) may be ` +
+          `busy/rate-limiting. Wait a moment and retry; already-downloaded parts resume. [${msg}]`;
+      } else {
+        const cap =
+          gpuBufferLimitGB > 0 ? `~${gpuBufferLimitGB.toFixed(1)} GB WebGPU buffer cap` : 'this GPU';
+        status = `⚠ ${m?.label ?? 'model'} couldn't load — it may exceed ${cap}. Pick a smaller model. [${msg}]`;
+      }
       return false;
     }
     loadPhase = '';
@@ -854,16 +1068,41 @@
       status = 'embedding query…';
       const qv = await pipe.embed(query);
       status = scope ? `retrieving (scoped: ${scopeLabel(scope)})…` : 'retrieving…';
+      graphInfo = '';
       // Scoped retrieval (FR-RET-004): over-fetch then keep only in-scope hits so a question
       // about one client never pulls another client's notes (no cross-client bleed).
-      const raw = filterByScope(await pipe.search(qv, scope ? 24 : 12), scopeIds);
-      // Precision pass on the over-fetch (ADR-018): drop the low-score tail so References,
-      // Micro-Map, and the grounded context carry only genuinely relevant notes — a 0.31 cosine
-      // hit is noise the small model would otherwise be asked to reconcile (FR-CHAT-002).
-      const relevant = relevantHits(raw);
-      // Favor BREADTH across distinct relevant documents (FR-CHAT-002): one best chunk per doc,
-      // up to 5 docs — so the answer synthesizes several notes at once and can reference them all.
-      hits = dedupeByDoc(relevant, 5);
+      let relevant: SearchHit[] = [];
+      const expandedIds = new Set<string>();
+      if (graphRagOn) {
+        // GraphRAG (Phase 3): vector seeds + graph-connected siblings. The relevance floor still
+        // gates the SEEDS (irrelevant notes must never anchor the answer — same precision as plain
+        // RAG, and the no-results guard fires when nothing clears it). Graph-expanded siblings are
+        // then KEPT even below the floor — they earn inclusion structurally (shared entities), which
+        // is exactly the context plain cosine misses (the quality lever). Seeds keep their cosine
+        // score for display; we don't surface the internal RRF fusion score to the user.
+        const rag = await pipe.graphRag(qv, {
+          seedK: scope ? 24 : 12,
+          expandK: 10,
+          k: scope ? 24 : 12
+        });
+        const seedRelevant = relevantHits(filterByScope(rag.seeds, scopeIds));
+        if (seedRelevant.length > 0) {
+          const expandedScoped = filterByScope(rag.expanded, scopeIds);
+          relevant = selectGraphRagContext(seedRelevant, expandedScoped);
+          const seedIds = new Set(seedRelevant.map((h) => h.chunkId));
+          for (const h of relevant) if (!seedIds.has(h.chunkId)) expandedIds.add(h.chunkId);
+        }
+      } else {
+        // Plain RAG: over-fetch → precision floor (ADR-018) drops the low-score tail so References,
+        // Micro-Map, and the grounded context carry only genuinely relevant notes (FR-CHAT-002).
+        relevant = relevantHits(filterByScope(await pipe.search(qv, scope ? 24 : 12), scopeIds));
+      }
+      // Favor BREADTH across distinct documents (FR-CHAT-002): one best chunk per doc. GraphRAG gets
+      // more room (8 docs) so the graph-connected siblings actually surface alongside the seeds.
+      hits = dedupeByDoc(relevant, graphRagOn ? 8 : 5);
+      graphExpandedIds = expandedIds;
+      const graphAdded = hits.filter((h) => expandedIds.has(h.chunkId)).length;
+      graphInfo = graphAdded > 0 ? `+${graphAdded} graph-connected` : '';
       references = referencesFromHits(hits);
       // Micro-Map (FR-GRAPH-001) + persist the retrieval sub-graph edges (FR-GRAPH-002).
       graph = buildMicroGraph(query, hits);
@@ -1239,6 +1478,16 @@
               onclick={() => (answerMode = 'grounded')}>📌 Grounded</button
             >
           </div>
+          <div class="mode-toggle" role="group" aria-label="Retrieval mode">
+            <button
+              class="mode-btn"
+              class:on={graphRagOn}
+              disabled={busy}
+              title="GraphRAG: also pull in chunks connected through SHARED ENTITIES, not just semantically similar ones — the context plain vector search misses. Falls back to plain RAG when the vault has no graph."
+              onclick={() => (graphRagOn = !graphRagOn)}
+              >🕸 GraphRAG {graphRagOn ? 'on' : 'off'}</button
+            >
+          </div>
         </div>
 
         {#if ready}
@@ -1326,11 +1575,20 @@
 
         {#if hits.length}
           <div class="sources">
-            <div class="block-h">Retrieved sources</div>
+            <div class="block-h">
+              Retrieved sources{#if graphInfo}
+                <span class="graph-badge" title="GraphRAG added chunks reached through shared entities"
+                  >🕸 {graphInfo}</span
+                >{/if}
+            </div>
             {#each hits as h, i (h.chunkId)}
               <button class="src" onclick={() => jumpTo(h.chunkId)}>
                 <span class="src-n">[#{i + 1}]</span>
                 {h.docId} <span class="score">{h.score.toFixed(2)}</span>
+                {#if graphExpandedIds.has(h.chunkId)}<span
+                    class="graph-badge"
+                    title="Pulled in via the entity graph, not vector similarity">🕸</span
+                  >{/if}
               </button>
             {/each}
           </div>
@@ -1623,7 +1881,73 @@
             {/if}
           </div>
         {/if}
+      {:else if selectedEntity}
+        <!-- Entity page (Phase 2 + 4): the entity's notes + a multi-hop graph over the PERSISTED graph -->
+        <div class="doc-head">
+          <div class="doc-title">
+            🕸 {selectedEntity.name}
+            <span class="badge">{selectedEntity.type}</span>
+            <span class="score">{selectedEntity.noteCount} notes</span>
+          </div>
+          <button class="back" onclick={closeEntity}>✕ close</button>
+        </div>
+        {#if graphBusy}
+          <div class="loading-banner"><span class="spinner"></span><span>traversing graph…</span></div>
+        {/if}
+        {#if entityGraph && entityGraph.edges.length}
+          <div class="micromap">
+            <div class="block-h">
+              Connections · {entityGraph.nodes.length - 1} entities within 2 hops
+            </div>
+            {#each entityGraph.edges as e (e.from + e.to + e.label)}
+              {@const fromN = entityGraph.nodes.find((n) => n.id === e.from)}
+              {@const toN = entityGraph.nodes.find((n) => n.id === e.to)}
+              <div class="rel-row">
+                <button class="tagchip" onclick={() => openEntityById(e.from)}
+                  >{fromN?.label ?? e.from}</button
+                >
+                <span class="rel-type">{e.label.replace(/_/g, ' ')}</span>
+                <button class="tagchip" onclick={() => openEntityById(e.to)}
+                  >{toN?.label ?? e.to}</button
+                >
+              </div>
+            {/each}
+          </div>
+        {:else if !graphBusy}
+          <div class="hint">No relations extracted for this entity yet.</div>
+        {/if}
+        {#if entityNotes.length}
+          <div class="block-h">📄 Notes mentioning {selectedEntity.name} — {entityNotes.length}</div>
+          {#each entityNotes as docId (docId)}
+            <button class="src" onclick={() => showSource(docId)}>
+              <span class="src-n">{docId}</span>
+            </button>
+          {/each}
+        {/if}
       {:else}
+        <!-- Entities pane (Phase 2): browse the knowledge graph like the Tag pane, but for the
+             people/orgs/concepts the LLM extracted at ingest. Click one to open its entity page. -->
+        <div class="block-h">
+          🕸 Entities{#if entityIndex.length} — {entityIndex.length}{/if}
+          <button class="back" onclick={buildVaultGraph} disabled={graphBusy}
+            >{graphBusy ? 'extracting…' : entityIndex.length ? '↻ rebuild' : '✨ build graph'}</button
+          >
+        </div>
+        {#if entityIndex.length}
+          <div class="tagbar">
+            {#each entityIndex.slice(0, 40) as e (e.id)}
+              <button class="tagchip" onclick={() => openEntity(e)} title={e.type}
+                >{e.name} <span class="tagcount">{e.noteCount}</span></button
+              >
+            {/each}
+          </div>
+        {:else}
+          <div class="hint">
+            No entity graph yet. Click “build graph” — it loads a chat model, reads your notes, and
+            extracts the people/orgs/concepts + how they connect, so GraphRAG can use them.
+          </div>
+        {/if}
+
         {#if tagIndex.length}
           <div class="block-h">🏷 Tags</div>
           <div class="tagbar">
@@ -2620,6 +2944,23 @@
   .tagcount {
     opacity: 0.6;
     font-size: 0.68rem;
+  }
+  .graph-badge {
+    font-size: 0.68rem;
+    color: #6750a4;
+    margin-left: 0.3rem;
+  }
+  .rel-row {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+    padding: 0.18rem 0;
+  }
+  .rel-type {
+    font-size: 0.68rem;
+    color: #79747e;
+    font-style: italic;
   }
   .tree-folder,
   .tree-file {

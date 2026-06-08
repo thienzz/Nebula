@@ -6,6 +6,14 @@ import { defineConfig } from 'vite';
 // These headers are required in DEV; the SAME two headers must also be
 // emitted by the Tauri production webview (see src-tauri/tauri.conf.json).
 // Verify `self.crossOriginIsolated === true` at runtime (Phase 0 GATE A).
+//
+// COEP is `credentialless` (not `require-corp`): both give crossOriginIsolated on Chromium, but
+// credentialless loads cross-origin resources credential-free without demanding a
+// `Cross-Origin-Resource-Policy` header — safer for third-party model CDNs (HuggingFace serves
+// shards via its xet CDN WITHOUT CORP). NOTE: the actual model-download fix lives in webllm.ts,
+// which switches WebLLM to the IndexedDB cache backend — under COEP the Cache API refuses to STORE
+// a cross-origin response lacking CORP (`Cache.put()` → NetworkError), even though the same bytes
+// fetch+read fine. IndexedDB stores the ArrayBuffer directly and sidesteps that check.
 const crossOriginIsolation = {
   name: 'cross-origin-isolation',
   configureServer(server: {
@@ -21,7 +29,7 @@ const crossOriginIsolation = {
   }) {
     server.middlewares.use((_req, res, next) => {
       res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
-      res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+      res.setHeader('Cross-Origin-Embedder-Policy', 'credentialless');
       next();
     });
   }
@@ -37,7 +45,7 @@ export default defineConfig({
     strictPort: true,
     headers: {
       'Cross-Origin-Opener-Policy': 'same-origin',
-      'Cross-Origin-Embedder-Policy': 'require-corp'
+      'Cross-Origin-Embedder-Policy': 'credentialless'
     },
     // Some WASM/worker deps don't like being pre-bundled.
     fs: { allow: ['..'] }

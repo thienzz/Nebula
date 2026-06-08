@@ -55,6 +55,13 @@ export class MockInferenceProvider implements InferenceProvider {
     };
   }
 
+  /** Raw-completion seam (entity extraction / auto-tag). Deterministic empty graph — tests that
+   * need real entities pass their own stub generator to extractEntities directly. */
+  async complete(_prompt: string): Promise<string> {
+    if (!this.loaded) throw new Error('Model not loaded');
+    return '{"entities":[],"relations":[]}';
+  }
+
   async unload(): Promise<void> {
     this.loaded = false;
   }
