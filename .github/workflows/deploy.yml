@@ -1,0 +1,56 @@
+name: Deploy to GitHub Pages
+
+# Builds the static SvelteKit SPA and publishes it to GitHub Pages on every push to main.
+# The live site needs cross-origin isolation (WebGPU / threaded WASM); GitHub Pages can't set
+# COOP/COEP headers, so coi-serviceworker.js supplies them client-side (ADR-039).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Least-privilege tokens for the Pages deployment.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time; cancel an in-flight run if a newer push arrives.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Build (static SPA)
+        run: npm run build
+        env:
+          # Project page is served under /<repo>; change this if you rename the repo or use a custom domain.
+          BASE_PATH: /Nebula
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: build
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

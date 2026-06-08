@@ -88,8 +88,6 @@ you're writing notes immediately. First run downloads the models **once** into y
 embedder + the chat model you pick); after that it works offline. **Semantic search needs no GPU** (WASM/CPU);
 local **chat** wants a WebGPU browser (Chrome/Edge/Arc, Safari 18+, Firefox rolling out) — on any OS, macOS included.
 
-> Prefer a native window? `npm run tauri:dev` wraps the *same* app in an optional Tauri desktop shell (Phase 2).
-
 ## Deploy it (host the tab anywhere)
 
 `npm run build` emits a static SvelteKit site in `build/`. It needs exactly two response headers to unlock
@@ -100,8 +98,12 @@ Cross-Origin-Opener-Policy: same-origin
 Cross-Origin-Embedder-Policy: credentialless
 ```
 
-- **Hosts with header config** (Cloudflare Pages / Netlify / Vercel) — drop a `_headers` file with those two lines.
-- **Hosts without** (e.g. GitHub Pages) — ship a tiny [`coi-serviceworker`](https://github.com/gzuidhof/coi-serviceworker) that injects them client-side.
+- **GitHub Pages (included, zero-config):** push to `main` → [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)
+  builds and publishes to `https://<user>.github.io/Nebula/`. Pages can't set headers, so a vendored
+  [`coi-serviceworker`](static/coi-serviceworker.js) injects them client-side (ADR-039). **One-time setup:** repo
+  **Settings → Pages → Source = "GitHub Actions"** (and keep the workflow's `BASE_PATH` matching the repo name).
+- **Hosts with header config** (Cloudflare Pages / Netlify / Vercel) — drop a `_headers` file with those two
+  lines and set `BASE_PATH=''` (root); the service worker becomes optional.
 - **Your data lives in the browser origin** (IndexedDB + Cache Storage): it survives refreshes but is per-browser/per-profile — so **Export Vault** (a one-click `.zip` of your `.md` notes + original files) is both your backup and your exit. Your knowledge is never locked in.
 
 ## Tests

@@ -3,6 +3,10 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- Cross-origin isolation for static hosts (GitHub Pages) — grants crossOriginIsolated client-side
+         so WebLLM/Transformers.js threaded WASM works without server COOP/COEP headers (ADR-039). Must
+         load first; it may reload the page once on first visit to take control. -->
+    <script src="%sveltekit.assets%/coi-serviceworker.js"></script>
     %sveltekit.head%
   </head>
   <body data-sveltekit-preload-data="hover">

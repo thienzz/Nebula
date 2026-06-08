@@ -16,7 +16,8 @@ export default [
       'dist/',
       'node_modules/',
       'package-lock.json',
-      'tests/bench/out/'
+      'tests/bench/out/',
+      'static/' // vendored static assets (e.g. coi-serviceworker.js — service-worker globals, ADR-039)
     ]
   },
   js.configs.recommended,
