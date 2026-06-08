@@ -16,7 +16,7 @@
     "test:int": "vitest run --config vitest.integration.config.ts",
     "test:models": "vitest run --config vitest.models.config.ts",
     "test:e2e": "playwright test",
-    "bench": "node tests/bench/run.mjs"
+    "bench": "vitest run --config vitest.bench.config.ts"
   },
   "dependencies": {
     "@huggingface/transformers": "^3",

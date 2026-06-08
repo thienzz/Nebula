@@ -1,0 +1,88 @@
+{
+  "mode": "synthetic",
+  "strategies": {
+    "raw": {
+      "recall": 1,
+      "precision": 0.333,
+      "f1": 0.5,
+      "tokens": 201,
+      "selectedCount": 12,
+      "hitCount": 4
+    },
+    "naive": {
+      "recall": 0.625,
+      "precision": 0.625,
+      "f1": 0.625,
+      "tokens": 67,
+      "selectedCount": 4,
+      "hitCount": 2.5
+    },
+    "compiled": {
+      "recall": 1,
+      "precision": 1,
+      "f1": 1,
+      "tokens": 67,
+      "selectedCount": 4,
+      "hitCount": 4
+    }
+  },
+  "perQuestion": [
+    {
+      "id": "atlas-status-risk",
+      "raw": {
+        "recall": 1,
+        "precision": 0.3333333333333333,
+        "f1": 0.5,
+        "tokens": 201,
+        "selectedCount": 12,
+        "hitCount": 4
+      },
+      "naive": {
+        "recall": 0.75,
+        "precision": 0.75,
+        "f1": 0.75,
+        "tokens": 65,
+        "selectedCount": 4,
+        "hitCount": 3
+      },
+      "compiled": {
+        "recall": 1,
+        "precision": 1,
+        "f1": 1,
+        "tokens": 65,
+        "selectedCount": 4,
+        "hitCount": 4
+      }
+    },
+    {
+      "id": "orion-status-risk",
+      "raw": {
+        "recall": 1,
+        "precision": 0.3333333333333333,
+        "f1": 0.5,
+        "tokens": 201,
+        "selectedCount": 12,
+        "hitCount": 4
+      },
+      "naive": {
+        "recall": 0.5,
+        "precision": 0.5,
+        "f1": 0.5,
+        "tokens": 69,
+        "selectedCount": 4,
+        "hitCount": 2
+      },
+      "compiled": {
+        "recall": 1,
+        "precision": 1,
+        "f1": 1,
+        "tokens": 69,
+        "selectedCount": 4,
+        "hitCount": 4
+      }
+    }
+  ],
+  "budgetPerQuestion": 69,
+  "vaultSize": 12,
+  "questionCount": 2
+}
