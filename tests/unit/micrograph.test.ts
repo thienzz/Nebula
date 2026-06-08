@@ -58,4 +58,26 @@ describe('buildMicroGraph', () => {
     expect(label.endsWith('…')).toBe(true);
     expect(label.length).toBeLessThanOrEqual(11);
   });
+
+  it('weights graph-expanded edges by shared-entity count (not cosine) and labels them', () => {
+    // c#0 has the LOWEST cosine (0.1) but is the most graph-connected (2 shared entities) — it must
+    // get the THICKEST edge, the opposite of what cosine alone would draw. a#0 stays a cosine seed.
+    const graphInfo = new Map([
+      ['c#0', { sharedCount: 2, sharedEntities: ['Atlas Migration', 'Priya Nair'] }],
+      ['b#0', { sharedCount: 1, sharedEntities: ['Priya Nair'] }]
+    ]);
+    const g = buildMicroGraph('q', hits, { graphInfo });
+    const ea = g.edges.find((e) => e.to === 'a#0')!; // seed: no graphInfo → cosine
+    const eb = g.edges.find((e) => e.to === 'b#0')!;
+    const ec = g.edges.find((e) => e.to === 'c#0')!;
+    expect(ea.viaGraph).toBeUndefined(); // seed weighted by cosine, not marked
+    expect(ec.viaGraph).toBe(true);
+    expect(ec.weight).toBe(1); // 2/2 shared = max → full-strength edge despite cosine 0.1
+    expect(eb.weight).toBe(0.5); // 1/2 shared
+    expect(ec.width).toBeGreaterThan(eb.width); // more shared entities → thicker
+    const nc = g.nodes.find((n) => n.id === 'c#0')!;
+    expect(nc.viaGraph).toBe(true);
+    expect(nc.sharedEntities).toEqual(['Atlas Migration', 'Priya Nair']);
+    expect(nc.score).toBe(0.1); // cosine still recorded for reference
+  });
 });

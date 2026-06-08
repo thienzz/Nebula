@@ -46,10 +46,17 @@ export interface NoteRecord {
   frontmatter?: Record<string, unknown>;
 }
 
+/** A graph-expanded hit: a sibling chunk reached through shared entities, carrying the proximity signal
+ *  so the UI can say WHY it was pulled in (and weight the Micro-Map by structure, not cosine). */
+export interface ExpandedHit extends SearchHit {
+  sharedCount: number; // how many seed entities this chunk shares (graph proximity)
+  sharedEntities: string[]; // display names of those shared entities
+}
+
 /** The three rankings GraphRAG produces: vector seeds, graph-expanded chunks, and the fused set. */
 export interface GraphRagResult {
   seeds: SearchHit[]; // pure vector top-K (semantic)
-  expanded: SearchHit[]; // sibling chunks reached via shared entities (structural)
+  expanded: ExpandedHit[]; // sibling chunks reached via shared entities (structural), with proximity
   fused: SearchHit[]; // the final, RRF-fused context fed to the LLM
   entityIds: string[]; // the entities the seeds mention (what the expansion hung off)
 }
@@ -258,9 +265,7 @@ export class VectorStore {
   }
 
   async count(): Promise<number> {
-    const [rows] = await this.q<[{ c: number }[]]>(
-      'SELECT count() AS c FROM chunk GROUP ALL'
-    );
+    const [rows] = await this.q<[{ c: number }[]]>('SELECT count() AS c FROM chunk GROUP ALL');
     return rows?.[0]?.c ?? 0;
   }
 
@@ -329,10 +334,10 @@ export class VectorStore {
 
   /** Record the content hash extracted for a doc (set after a successful extraction). */
   async setGraphHash(docId: string, hash: string): Promise<void> {
-    await this.q(
-      'UPSERT type::thing("graphmeta", $id) CONTENT { docId: $id, hash: $hash }',
-      { id: docId, hash }
-    );
+    await this.q('UPSERT type::thing("graphmeta", $id) CONTENT { docId: $id, hash: $hash }', {
+      id: docId,
+      hash
+    });
   }
 
   /** All entity nodes (for the entities pane / pure index builders). */
@@ -350,9 +355,9 @@ export class VectorStore {
 
   /** All mention edges as flat {docId, chunkId, entityId} rows (for the pure index builders). */
   async allMentions(): Promise<MentionEdge[]> {
-    const [rows] = await this.q<
-      [{ docId: string; chunkId: string; entityId: string }[]]
-    >('SELECT docId, in.chunkId AS chunkId, out.entityId AS entityId FROM mentions');
+    const [rows] = await this.q<[{ docId: string; chunkId: string; entityId: string }[]]>(
+      'SELECT docId, in.chunkId AS chunkId, out.entityId AS entityId FROM mentions'
+    );
     return (rows ?? []).filter((r) => r.chunkId && r.entityId);
   }
 
@@ -363,7 +368,12 @@ export class VectorStore {
     >('SELECT in.entityId AS sourceId, out.entityId AS targetId, type, docId FROM relates');
     return (rows ?? [])
       .filter((r) => r.sourceId && r.targetId)
-      .map((r) => ({ sourceId: r.sourceId, targetId: r.targetId, type: r.type, docId: r.docId ?? undefined }));
+      .map((r) => ({
+        sourceId: r.sourceId,
+        targetId: r.targetId,
+        type: r.type,
+        docId: r.docId ?? undefined
+      }));
   }
 
   /** The distinct docIds that mention an entity (its provenance / "backlinks"). */
@@ -433,9 +443,7 @@ export class VectorStore {
   async relationsAmong(entityIds: string[]): Promise<RelationEdge[]> {
     if (entityIds.length === 0) return [];
     const ents = entityIds.map((id) => new RecordId('entity', id));
-    const [rows] = await this.q<
-      [{ sourceId: string; targetId: string; type: string }[]]
-    >(
+    const [rows] = await this.q<[{ sourceId: string; targetId: string; type: string }[]]>(
       'SELECT in.entityId AS sourceId, out.entityId AS targetId, type FROM relates WHERE in IN $ents AND out IN $ents',
       { ents }
     );
@@ -464,25 +472,27 @@ export class VectorStore {
     }
 
     // Sibling chunks mentioning the seed entities, scored vs the query in-DB (one row per mention).
+    // `entityName` rides along so we can report WHICH entities connect each sibling (UI + Micro-Map).
     const ents = entityIds.map((id) => new RecordId('entity', id));
-    const [rows] = await this.q<[(ChunkRow & { chunkId: string })[]]>(
+    const [rows] = await this.q<[(ChunkRow & { chunkId: string; entityName: string | null })[]]>(
       `SELECT in.chunkId AS chunkId, in.docId AS docId, in.text AS text, in.page AS page,
-              in.charStart AS charStart, in.charEnd AS charEnd,
+              in.charStart AS charStart, in.charEnd AS charEnd, out.name AS entityName,
               vector::similarity::cosine(in.embedding, $q) AS dist
        FROM mentions WHERE out IN $ents`,
       { q: queryVec, ents }
     );
 
-    // Aggregate to one hit per sibling chunk, counting shared entities = graph proximity.
-    const byChunk = new Map<string, { hit: SearchHit; shared: number }>();
+    // Aggregate to one hit per sibling chunk: the SET of shared entities = graph proximity (count +
+    // names). Names are kept so a chunk reached purely through the graph can explain why it's here.
+    const byChunk = new Map<string, { hit: SearchHit; shared: Set<string> }>();
     for (const r of rows ?? []) {
       if (!r.chunkId || seedChunkIds.has(r.chunkId)) continue; // drop seeds — they're the vector side
       const existing = byChunk.get(r.chunkId);
       if (existing) {
-        existing.shared += 1;
+        if (r.entityName) existing.shared.add(r.entityName);
       } else {
         byChunk.set(r.chunkId, {
-          shared: 1,
+          shared: new Set(r.entityName ? [r.entityName] : []),
           hit: {
             chunkId: r.chunkId,
             docId: r.docId,
@@ -495,10 +505,10 @@ export class VectorStore {
         });
       }
     }
-    const expanded = [...byChunk.values()]
-      .sort((a, b) => b.shared - a.shared || b.hit.score - a.hit.score)
+    const expanded: ExpandedHit[] = [...byChunk.values()]
+      .sort((a, b) => b.shared.size - a.shared.size || b.hit.score - a.hit.score)
       .slice(0, expandK)
-      .map((x) => x.hit);
+      .map((x) => ({ ...x.hit, sharedCount: x.shared.size, sharedEntities: [...x.shared] }));
 
     const fused = fuseGraphRag(seeds, expanded, { k });
     return { seeds, expanded, fused, entityIds };

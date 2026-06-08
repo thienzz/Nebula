@@ -18,13 +18,16 @@ export interface GraphNode {
   docId?: string;
   page?: number;
   score?: number; // cosine similarity for chunk nodes
+  viaGraph?: boolean; // reached through the entity graph (shared entities), not vector similarity
+  sharedEntities?: string[]; // the seed entities this chunk shares (set only when viaGraph)
 }
 
 export interface GraphEdge {
   from: 'query';
   to: string; // chunkId
-  weight: number; // raw cosine similarity (0..1)
+  weight: number; // proximity (0..1): cosine for seeds, normalised shared-entity count for graph nodes
   width: number; // stroke width for the UI, scaled from weight
+  viaGraph?: boolean; // weight reflects graph proximity (shared entities), not cosine
 }
 
 export interface MicroGraph {
@@ -37,6 +40,10 @@ export interface MicroGraphOptions {
   minWidth?: number; // stroke for similarity 0 (default 1)
   maxWidth?: number; // stroke for similarity 1 (default 6)
   labelMax?: number; // truncate the query label (default 48)
+  /** Per-chunk graph-proximity info (chunkId → shared entities). When a hit appears here it's a
+   *  graph-expanded node: it's labelled with its shared entities and its edge is weighted by
+   *  shared-entity count (graph proximity), not cosine — exactly the signal cosine misses. */
+  graphInfo?: Map<string, { sharedCount: number; sharedEntities: string[] }>;
 }
 
 const clamp = (x: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, x));
@@ -63,25 +70,33 @@ export function buildMicroGraph(
   const labelMax = opts.labelMax ?? 48;
 
   const top = hits.slice(0, topN);
+  const graphInfo = opts.graphInfo;
+  // Graph-expanded nodes earn their place STRUCTURALLY (shared entities), so weight their edge by
+  // graph proximity (shared-entity count, normalised) — NOT cosine, which is low for exactly these.
+  // Seed nodes keep cosine. With no graphInfo this is a no-op: everything weights by cosine as before.
+  const maxShared = Math.max(1, ...top.map((h) => graphInfo?.get(h.chunkId)?.sharedCount ?? 0));
 
   const nodes: GraphNode[] = [{ id: 'query', kind: 'query', label: truncate(query, labelMax) }];
   const edges: GraphEdge[] = [];
 
   for (const hit of top) {
-    const weight = clamp(hit.score, 0, 1);
+    const gi = graphInfo?.get(hit.chunkId);
+    const weight = gi ? clamp(gi.sharedCount / maxShared, 0, 1) : clamp(hit.score, 0, 1);
     nodes.push({
       id: hit.chunkId,
       kind: 'chunk',
       label: hit.page === undefined ? hit.docId : `${hit.docId} · p.${hit.page}`,
       docId: hit.docId,
       page: hit.page,
-      score: round2(hit.score)
+      score: round2(hit.score),
+      ...(gi ? { viaGraph: true, sharedEntities: gi.sharedEntities } : {})
     });
     edges.push({
       from: 'query',
       to: hit.chunkId,
-      weight: round2(hit.score),
-      width: round2(minWidth + weight * (maxWidth - minWidth))
+      weight: round2(weight),
+      width: round2(minWidth + weight * (maxWidth - minWidth)),
+      ...(gi ? { viaGraph: true } : {})
     });
   }
 

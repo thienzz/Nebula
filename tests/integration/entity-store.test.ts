@@ -7,9 +7,30 @@ import { buildEntityIndex } from '../../src/lib/graph/entity-index';
 // fixtures. Mini-graph: Acme —hires→ John —leads→ Project X —uses→ Widget, spread over 3 docs.
 
 const chunks: ChunkRecord[] = [
-  { chunkId: 'd1#0', docId: 'd1', text: 'Acme hired John Doe.', charStart: 0, charEnd: 20, embedding: [1, 0, 0] },
-  { chunkId: 'd2#0', docId: 'd2', text: 'John Doe leads Project X.', charStart: 0, charEnd: 25, embedding: [0, 1, 0] },
-  { chunkId: 'd3#0', docId: 'd3', text: 'Project X uses Widget.', charStart: 0, charEnd: 22, embedding: [0, 0, 1] }
+  {
+    chunkId: 'd1#0',
+    docId: 'd1',
+    text: 'Acme hired John Doe.',
+    charStart: 0,
+    charEnd: 20,
+    embedding: [1, 0, 0]
+  },
+  {
+    chunkId: 'd2#0',
+    docId: 'd2',
+    text: 'John Doe leads Project X.',
+    charStart: 0,
+    charEnd: 25,
+    embedding: [0, 1, 0]
+  },
+  {
+    chunkId: 'd3#0',
+    docId: 'd3',
+    text: 'Project X uses Widget.',
+    charStart: 0,
+    charEnd: 22,
+    embedding: [0, 0, 1]
+  }
 ];
 
 const entities = [
@@ -98,6 +119,10 @@ describe('GraphRAG retrieval (vector seed + graph expansion, fused)', () => {
     expect(res.seeds.map((h) => h.chunkId)).toEqual(['d1#0']);
     // Acme/John's entities expand to d2#0 (John leads Project X) — semantically distant, structurally near.
     expect(res.expanded.map((h) => h.chunkId)).toContain('d2#0');
+    // …and it explains WHY it's here: the seed entity it shares (John Doe), with a count.
+    const d2 = res.expanded.find((h) => h.chunkId === 'd2#0')!;
+    expect(d2.sharedCount).toBe(1);
+    expect(d2.sharedEntities).toEqual(['John Doe']);
     // The fused context therefore contains BOTH the seed and the graph-reached sibling.
     const fusedIds = res.fused.map((h) => h.chunkId);
     expect(fusedIds).toContain('d1#0');

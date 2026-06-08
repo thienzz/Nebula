@@ -7,7 +7,7 @@
   // Export Vault → .zip of .md proxies + original binaries under sources/ (FR-DATA-006). In-browser.
   import { onMount, tick } from 'svelte';
   import type { SearchHit } from '$lib/inference/provider';
-  import type { NoteRecord } from '$lib/db/store';
+  import type { NoteRecord, ExpandedHit } from '$lib/db/store';
   import { buildTitleIndex, weaveLinks, notePreview, type WovenSegment } from '$lib/weave/weaver';
   import { buildMicroGraph, type MicroGraph } from '$lib/graph/micrograph';
   import { selectGraphRagContext } from '$lib/retrieval/graphrag';
@@ -198,6 +198,8 @@
   let graphRagOn = $state(true); // use GraphRAG when the vault has a graph (degrades to plain RAG)
   let graphInfo = $state(''); // e.g. "+3 graph-connected" — shows GraphRAG actually expanded context
   let graphExpandedIds = $state(new Set<string>()); // chunkIds that entered via graph expansion (badge)
+  // chunkId → which seed entities connect it: drives the source label + Micro-Map edge weight (ADR-029 follow-up)
+  let graphShared = $state(new Map<string, { sharedCount: number; sharedEntities: string[] }>());
   let entityIndex = $state<EntityEntry[]>([]); // the Entities pane (built from persisted edges)
   let entityRelations = $state<RelationEdge[]>([]); // all relations, for the entity graph view
   let selectedEntity = $state<EntityEntry | null>(null); // open entity page
@@ -238,7 +240,7 @@
       opts: { seedK: number; expandK: number; k: number }
     ) => Promise<{
       seeds: SearchHit[];
-      expanded: SearchHit[];
+      expanded: ExpandedHit[];
       fused: SearchHit[];
       entityIds: string[];
     }>;
@@ -672,7 +674,8 @@
       return;
     }
     const node = entityGraph?.nodes.find((n) => n.id === id);
-    if (node) void openEntity({ id, name: node.label, type: node.type ?? '', noteCount: 0, docIds: [] });
+    if (node)
+      void openEntity({ id, name: node.label, type: node.type ?? '', noteCount: 0, docIds: [] });
   }
 
   /** One-click: extract the entity graph across the whole vault (loads the model if needed). */
@@ -1014,16 +1017,17 @@
       // Distinguish a DOWNLOAD failure (network / HuggingFace 503 / Cache.add) from a real GPU OOM.
       // The old code blamed every failure on the buffer cap — misleading during a host outage, where
       // the right action is "retry" (cached shards resume), not "pick a smaller model".
-      const isDownload = /cache|network|fetch|failed to execute 'add'|http|50\d|429|timeout|load/i.test(
-        msg
-      );
+      const isDownload =
+        /cache|network|fetch|failed to execute 'add'|http|50\d|429|timeout|load/i.test(msg);
       if (isDownload) {
         status =
           `⚠ ${m?.label ?? 'model'} download didn't finish — the model host (HuggingFace) may be ` +
           `busy/rate-limiting. Wait a moment and retry; already-downloaded parts resume. [${msg}]`;
       } else {
         const cap =
-          gpuBufferLimitGB > 0 ? `~${gpuBufferLimitGB.toFixed(1)} GB WebGPU buffer cap` : 'this GPU';
+          gpuBufferLimitGB > 0
+            ? `~${gpuBufferLimitGB.toFixed(1)} GB WebGPU buffer cap`
+            : 'this GPU';
         status = `⚠ ${m?.label ?? 'model'} couldn't load — it may exceed ${cap}. Pick a smaller model. [${msg}]`;
       }
       return false;
@@ -1073,6 +1077,7 @@
       // about one client never pulls another client's notes (no cross-client bleed).
       let relevant: SearchHit[] = [];
       const expandedIds = new Set<string>();
+      let expandedForLabels: ExpandedHit[] = [];
       if (graphRagOn) {
         // GraphRAG (Phase 3): vector seeds + graph-connected siblings. The relevance floor still
         // gates the SEEDS (irrelevant notes must never anchor the answer — same precision as plain
@@ -1085,6 +1090,7 @@
           expandK: 10,
           k: scope ? 24 : 12
         });
+        expandedForLabels = rag.expanded;
         const seedRelevant = relevantHits(filterByScope(rag.seeds, scopeIds));
         if (seedRelevant.length > 0) {
           const expandedScoped = filterByScope(rag.expanded, scopeIds);
@@ -1101,11 +1107,17 @@
       // more room (8 docs) so the graph-connected siblings actually surface alongside the seeds.
       hits = dedupeByDoc(relevant, graphRagOn ? 8 : 5);
       graphExpandedIds = expandedIds;
+      graphShared = new Map(
+        expandedForLabels.map((h) => [
+          h.chunkId,
+          { sharedCount: h.sharedCount, sharedEntities: h.sharedEntities }
+        ])
+      );
       const graphAdded = hits.filter((h) => expandedIds.has(h.chunkId)).length;
       graphInfo = graphAdded > 0 ? `+${graphAdded} graph-connected` : '';
       references = referencesFromHits(hits);
       // Micro-Map (FR-GRAPH-001) + persist the retrieval sub-graph edges (FR-GRAPH-002).
-      graph = buildMicroGraph(query, hits);
+      graph = buildMicroGraph(query, hits, { graphInfo: graphShared });
       try {
         await pipe.relate('current', hits);
       } catch {
@@ -1577,18 +1589,22 @@
           <div class="sources">
             <div class="block-h">
               Retrieved sources{#if graphInfo}
-                <span class="graph-badge" title="GraphRAG added chunks reached through shared entities"
-                  >🕸 {graphInfo}</span
+                <span
+                  class="graph-badge"
+                  title="GraphRAG added chunks reached through shared entities">🕸 {graphInfo}</span
                 >{/if}
             </div>
             {#each hits as h, i (h.chunkId)}
               <button class="src" onclick={() => jumpTo(h.chunkId)}>
                 <span class="src-n">[#{i + 1}]</span>
-                {h.docId} <span class="score">{h.score.toFixed(2)}</span>
+                {h.docId}
                 {#if graphExpandedIds.has(h.chunkId)}<span
                     class="graph-badge"
-                    title="Pulled in via the entity graph, not vector similarity">🕸</span
-                  >{/if}
+                    title="Reached through the entity graph (not vector similarity) — shared: {(
+                      graphShared.get(h.chunkId)?.sharedEntities ?? []
+                    ).join(', ')}"
+                    >🕸 {(graphShared.get(h.chunkId)?.sharedEntities ?? []).join(', ')}</span
+                  >{:else}<span class="score">{h.score.toFixed(2)}</span>{/if}
               </button>
             {/each}
           </div>
@@ -1612,14 +1628,25 @@
                   stroke="#6750a4"
                   stroke-width={e.width}
                   stroke-opacity="0.55"
+                  stroke-dasharray={e.viaGraph ? '4 3' : undefined}
                 />
               {/each}
               <circle cx="40" cy="24" r="9" fill="#6750a4" />
               <text x="40" y="44" text-anchor="middle" class="g-label">query</text>
               {#each graph.nodes.filter((n) => n.kind === 'chunk') as n, i (n.id)}
                 {@const cy = 30 + i * 30}
-                <circle cx="76%" {cy} r="6" fill="#efeaf8" stroke="#6750a4" />
-                <text x="80%" y={cy + 4} class="g-label">{n.label} · {n.score}</text>
+                <circle
+                  cx="76%"
+                  {cy}
+                  r="6"
+                  fill={n.viaGraph ? '#6750a4' : '#efeaf8'}
+                  stroke="#6750a4"
+                />
+                <text x="80%" y={cy + 4} class="g-label"
+                  >{n.label}{#if n.viaGraph}
+                    · 🕸 {(n.sharedEntities ?? []).join(', ')}{:else}
+                    · {n.score}{/if}</text
+                >
               {/each}
             </svg>
           </div>
@@ -1892,7 +1919,9 @@
           <button class="back" onclick={closeEntity}>✕ close</button>
         </div>
         {#if graphBusy}
-          <div class="loading-banner"><span class="spinner"></span><span>traversing graph…</span></div>
+          <div class="loading-banner">
+            <span class="spinner"></span><span>traversing graph…</span>
+          </div>
         {/if}
         {#if entityGraph && entityGraph.edges.length}
           <div class="micromap">
@@ -1917,7 +1946,9 @@
           <div class="hint">No relations extracted for this entity yet.</div>
         {/if}
         {#if entityNotes.length}
-          <div class="block-h">📄 Notes mentioning {selectedEntity.name} — {entityNotes.length}</div>
+          <div class="block-h">
+            📄 Notes mentioning {selectedEntity.name} — {entityNotes.length}
+          </div>
           {#each entityNotes as docId (docId)}
             <button class="src" onclick={() => showSource(docId)}>
               <span class="src-n">{docId}</span>
@@ -1928,9 +1959,14 @@
         <!-- Entities pane (Phase 2): browse the knowledge graph like the Tag pane, but for the
              people/orgs/concepts the LLM extracted at ingest. Click one to open its entity page. -->
         <div class="block-h">
-          🕸 Entities{#if entityIndex.length} — {entityIndex.length}{/if}
+          🕸 Entities{#if entityIndex.length}
+            — {entityIndex.length}{/if}
           <button class="back" onclick={buildVaultGraph} disabled={graphBusy}
-            >{graphBusy ? 'extracting…' : entityIndex.length ? '↻ rebuild' : '✨ build graph'}</button
+            >{graphBusy
+              ? 'extracting…'
+              : entityIndex.length
+                ? '↻ rebuild'
+                : '✨ build graph'}</button
           >
         </div>
         {#if entityIndex.length}
