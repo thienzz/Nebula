@@ -2,7 +2,8 @@ import { describe, it, expect } from 'vitest';
 import {
   resolveCitationTarget,
   resolveCitations,
-  buildHighlightSegments
+  buildHighlightSegments,
+  answerUsage
 } from '../../src/lib/chat/citation';
 import type { SearchHit } from '../../src/lib/inference/provider';
 
@@ -60,5 +61,18 @@ describe('buildHighlightSegments', () => {
     const doc = 'short';
     expect(buildHighlightSegments(doc, -5, 999)).toEqual({ pre: '', hit: 'short', post: '' });
     expect(buildHighlightSegments(doc, 3, 2)).toEqual({ pre: 'sho', hit: '', post: 'rt' }); // empty hit
+  });
+});
+
+describe('answerUsage', () => {
+  it('reports which retrieved hits the answer actually cited (LLM provenance), ignoring unknowns', () => {
+    const u = answerUsage(['a#0', 'b#1', 'c#2'], ['b#1', 'b#1', 'ghost']);
+    expect(u.count).toBe(1); // only b#1 is both retrieved AND cited (deduped; ghost wasn't retrieved)
+    expect(u.used.has('b#1')).toBe(true);
+    expect(u.used.has('a#0')).toBe(false);
+  });
+
+  it('count is 0 when the answer cited nothing retrieved (e.g. no citations)', () => {
+    expect(answerUsage(['a#0', 'b#1'], []).count).toBe(0);
   });
 });

@@ -74,3 +74,17 @@ export function buildHighlightSegments(
     post: docText.slice(end)
   };
 }
+
+/**
+ * Of the retrieved hits, which ones the answer ACTUALLY cited — the model's own provenance, a subset
+ * of the embedding/graph candidates it was fed. Lets the UI mark "used by the answer" vs merely
+ * retrieved, so "how the AI answered" reflects the LLM's stated usage, not just cosine (FR-CHAT-002).
+ */
+export function answerUsage(
+  hitChunkIds: string[],
+  citedChunkIds: string[]
+): { used: Set<string>; count: number } {
+  const cited = new Set(citedChunkIds);
+  const used = new Set(hitChunkIds.filter((id) => cited.has(id)));
+  return { used, count: used.size };
+}

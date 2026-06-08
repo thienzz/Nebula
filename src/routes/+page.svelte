@@ -17,7 +17,7 @@
   import { buildEntityGraph, type EntityGraph, type GraphNeighbor } from '$lib/graph/entity-graph';
   import type { EntityRecord, MentionEdge, RelationEdge } from '$lib/graph/types';
   import type { TextGenerator } from '$lib/ingest/autotag';
-  import { resolveCitationTarget, buildHighlightSegments } from '$lib/chat/citation';
+  import { resolveCitationTarget, buildHighlightSegments, answerUsage } from '$lib/chat/citation';
   import { exportVaultZip } from '$lib/vault/export';
   import { intake } from '$lib/ingest/intake';
   import { csvToMarkdown } from '$lib/ingest/csv';
@@ -1586,18 +1586,31 @@
         {/if}
 
         {#if hits.length}
+          {@const usage = answerUsage(
+            hits.map((h) => h.chunkId),
+            cites.map((c) => c.chunkId)
+          )}
           <div class="sources">
             <div class="block-h">
               Retrieved sources{#if graphInfo}
                 <span
                   class="graph-badge"
                   title="GraphRAG added chunks reached through shared entities">🕸 {graphInfo}</span
+                >{/if}{#if usage.count > 0}
+                <span
+                  class="used-badge"
+                  title="How many retrieved notes the model actually cited in its answer — the LLM's own provenance, not the embedding/graph candidate set"
+                  >✓ answer used {usage.count}/{hits.length}</span
                 >{/if}
             </div>
             {#each hits as h, i (h.chunkId)}
-              <button class="src" onclick={() => jumpTo(h.chunkId)}>
+              {@const used = usage.used.has(h.chunkId)}
+              <button class="src" class:used onclick={() => jumpTo(h.chunkId)}>
                 <span class="src-n">[#{i + 1}]</span>
-                {h.docId}
+                {h.docId}{#if used}<span
+                    class="used-tag"
+                    title="Cited by the answer — the model actually used this">✓ used</span
+                  >{/if}
                 {#if graphExpandedIds.has(h.chunkId)}<span
                     class="graph-badge"
                     title="Reached through the entity graph (not vector similarity) — shared: {(
@@ -2714,6 +2727,22 @@
   .score {
     float: right;
     color: #9a9aa2;
+  }
+  .used-tag {
+    color: #1a7f37;
+    font-weight: 600;
+    font-size: 0.72rem;
+    margin-left: 0.35rem;
+  }
+  .used-badge {
+    color: #1a7f37;
+    font-weight: 600;
+    font-size: 0.72rem;
+    margin-left: 0.4rem;
+  }
+  .src.used {
+    border-color: #bfe3c8;
+    background: #f6fcf8;
   }
   .graph {
     background: #fff;
