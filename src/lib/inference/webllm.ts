@@ -42,6 +42,15 @@ export class WebLLMProvider implements InferenceProvider {
     }
   }
 
+  /**
+   * Remove ALL of this model's cached data (weights + wasm + chat config) from the browser, freeing
+   * the disk it occupied (FR-MDL). Re-downloadable anytime. Uses the SAME `indexeddb` cacheBackend
+   * the weights were stored under, so it actually clears them (the default Cache backend would miss).
+   */
+  async deleteModel(modelId: string): Promise<void> {
+    await webllm.deleteModelAllInfoInCache(modelId, APP_CONFIG);
+  }
+
   async loadModel(modelId: string, onProgress: (p: number) => void): Promise<void> {
     this.engine = await webllm.CreateMLCEngine(modelId, {
       appConfig: APP_CONFIG,

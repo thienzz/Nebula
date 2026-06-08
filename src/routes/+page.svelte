@@ -51,6 +51,17 @@
     dailyNoteBody
   } from '$lib/vault/template';
   import { buildFileTree, type TreeNode } from '$lib/nav/tree';
+  import { layoutEntityGraph, entityColor, type GraphLayout } from '$lib/graph/graph-layout';
+  import {
+    folderOf,
+    isUnder,
+    notesUnderFolder,
+    repathUnderFolder,
+    deriveChildFolder,
+    renamedFolderPath,
+    allFolders
+  } from '$lib/nav/folders';
+  import * as uiPrefs from '$lib/settings/ui-prefs';
   import { buildTagIndex, notesForTag, coerceTags, extractInlineTags } from '$lib/nav/tags';
   import { scopeDocIds, filterByScope, scopeLabel, type Scope } from '$lib/retrieval/scope';
   import {
@@ -207,6 +218,34 @@
   let entityNotes = $state<string[]>([]); // docIds mentioning the selected entity
   let graphBusy = $state(false);
 
+  // Workspace view (FR-NAV-002): 'files' = folder tree + the open note SIDE BY SIDE (the tree is
+  // always present — opening a note fills the doc panel beside it, never replaces the tree, the
+  // Obsidian explorer model); 'graph' = the Entities section: an entity list + a node-link graph.
+  let rightView = $state<'files' | 'graph'>('files');
+  let entityQuery = $state(''); // filter box for the Graph-mode entity list
+
+  // Empty folders the user created (folders are otherwise derived from note paths) — persisted in
+  // localStorage so an EMPTY folder survives a refresh without touching the SurrealDB schema.
+  let emptyFolders = $state<string[]>([]);
+
+  // File-tree direct manipulation (FR-NAV-002): a right-click context menu (add/rename/move/delete,
+  // new folder) + drag-a-note-onto-a-folder to move it. `dropFolder` highlights the hovered target.
+  let ctxMenu = $state<{
+    x: number;
+    y: number;
+    kind: 'file' | 'folder' | 'root';
+    path: string;
+  } | null>(null);
+  let dragDocId = $state<string | null>(null);
+  let dropFolder = $state<string | null>(null);
+
+  // Startup model gate (FR-MDL-005): on first run, choose which chat model to warm up in the
+  // BACKGROUND before any Ask / build-graph, so generation is ready the moment it's first needed.
+  let modelGate = $state(false);
+  let wantBackgroundLoad = false; // a model was chosen before `pipe` existed → load once it's ready
+  let cachedModels = $state<Set<string>>(new Set()); // model ids already downloaded to this browser
+  let deletingModel = $state(''); // id mid-deletion (disables its row)
+
   // Context Compiler UI (FR-CTX-*) — compact, token-counted share to another LLM.
   const COMPILE_MODELS = ['gpt-4o', 'gpt-4', 'claude-sonnet', 'claude-opus'];
   let compileOpen = $state(false);
@@ -256,6 +295,7 @@
     mentionsForEntity: (id: string) => Promise<{ docId: string; chunkId: string }[]>;
     provider: {
       isCached: (m: string) => Promise<boolean>;
+      deleteModel: (m: string) => Promise<void>;
       loadModel: (m: string, cb: (p: number) => void) => Promise<void>;
       complete?: (p: string, o?: { maxTokens?: number }) => Promise<string>;
       generate: (
@@ -316,6 +356,14 @@
       const rec = recommendModel(!!gpu?.ok);
       if (rec) modelId = rec.id;
     }
+    // Restore UI prefs + raise the startup model gate (FR-MDL-005). A saved pick overrides the GPU
+    // recommendation; first run (never onboarded) shows the gate so the user picks what to warm up.
+    emptyFolders = uiPrefs.getEmptyFolders();
+    rightView = uiPrefs.getView();
+    const savedModel = uiPrefs.getModelPref();
+    if (savedModel && MODELS.some((m) => m.id === savedModel)) modelId = savedModel;
+    modelGate = !uiPrefs.isOnboarded();
+
     const [{ createEmbedClient }, { VectorStore }, { WebLLMProvider }, { EMBEDDING_DIM }] =
       await Promise.all([
         import('$lib/embed/embed-client'),
@@ -464,12 +512,26 @@
     };
     status = 'ready';
     ready = true;
-    void refreshEntities(); // populate the Entities pane from any graph persisted in a prior session
+    // Populate the Entities pane from any graph persisted in a prior session — and if the user is
+    // landing straight on the Graph tab (restored view) with a graph already present, open the top
+    // entity so the node-link map shows immediately rather than an empty "pick an entity" canvas.
+    void refreshEntities().then(() => {
+      if (rightView === 'graph' && !selectedEntity && entityIndex.length)
+        void openEntity(entityIndex[0]);
+    });
 
-    // Auto-preload the selected model IF it's already cached (no download) so the first Ask is
-    // instant (ADR-030). We never auto-DOWNLOAD a multi-GB model unasked — uncached models wait for
-    // an explicit Ask / "Preload" click.
-    if (await pipe.provider.isCached(modelId).catch(() => false)) void preloadModel();
+    // Warm up in the background (FR-MDL-005 / ADR-030): load the chat model AND auto-build the entity
+    // graph so the Graph tab shows a visualization on its own. If the user already has a saved pick
+    // (chose at the gate in any session), honor it — downloading if needed, since picking IS the
+    // consent — so a refresh re-warms automatically. With no pick we only warm when already cached
+    // (instant, no surprise multi-GB download). While the gate is still open we wait: chooseModel()
+    // kicks off the warm-up the moment the user picks.
+    if (wantBackgroundLoad) void warmStartup();
+    else if (!modelGate) {
+      const hasPick = !!savedModel;
+      if (hasPick || (await pipe.provider.isCached(modelId).catch(() => false))) void warmStartup();
+    }
+    if (modelGate) void refreshModelCacheStatus(); // first-run gate is open → show "on disk" badges
   });
 
   const today = (): string => new Date().toISOString().slice(0, 10);
@@ -642,6 +704,8 @@
   async function openEntity(e: EntityEntry) {
     if (!pipe) return;
     selectedEntity = e;
+    rightView = 'graph'; // the entity opens in the Graph section's node-link canvas
+    entityQuery = '';
     graphBusy = true;
     entityGraph = null;
     entityNotes = [];
@@ -699,6 +763,10 @@
       status =
         `graph ready · ${entityIndex.length} entities · ${extracted} extracted` +
         (skipped ? `, ${skipped} unchanged (skipped)` : '');
+      // If the user is looking at the Graph tab, open the top entity so the node-link map appears
+      // right away rather than leaving an empty "pick an entity" canvas after a build.
+      if (rightView === 'graph' && !selectedEntity && entityIndex.length)
+        void openEntity(entityIndex[0]);
     } finally {
       graphBusy = false;
     }
@@ -790,18 +858,26 @@
 
   // Delete a note (FR-NOTE-009): remove it from the vault + drop its chunks from the index. Works
   // for hand-written notes AND proxy notes (the untouched original under sources/ is unaffected).
-  async function deleteNote(docId: string) {
-    if (!pipe || !ready) return;
-    if (!confirm(`Delete ${docId}?\nThis removes it from the vault and the search index.`)) return;
+  /** Purge a note from the index, the persisted note doc, its graph edges, and any source binary —
+   *  WITHOUT touching the in-memory `vault` array (the caller mutates that once, in bulk). Shared by
+   *  single-note delete and folder delete so both stay consistent after a refresh. */
+  async function removeNoteCompletely(docId: string) {
+    if (!pipe) return;
     await pipe.removeDoc(docId);
     await pipe.forgetNote(docId); // drop the persisted note doc too, so it stays deleted after refresh
     await pipe.clearGraph(docId); // and its entity-graph edges (entity nodes stay if other docs use them)
-    void refreshEntities();
     const gone = vault.find((n) => n.docId === docId);
     if (gone?.sourcePath) {
       originals = originals.filter((o) => o.path !== gone.sourcePath);
       await deleteSource(gone.sourcePath); // forget the persisted original binary too
     }
+  }
+
+  async function deleteNote(docId: string) {
+    if (!pipe || !ready) return;
+    if (!confirm(`Delete ${docId}?\nThis removes it from the vault and the search index.`)) return;
+    await removeNoteCompletely(docId);
+    void refreshEntities();
     vault = vault.filter((n) => n.docId !== docId);
     if (activeDoc === docId) {
       activeDoc = null;
@@ -894,20 +970,20 @@
 
   // Move a note to another folder (FR-NOTE-008): the filename (slug) and title are unchanged, so
   // title-based wikilinks keep resolving — only the docId/path changes, re-keyed in the index.
-  async function moveNoteAction(note: Note) {
+  /** Move ONE note into `destFolder` (re-key its chunks + persist) — shared by the Move… prompt and
+   *  by drag-dropping a note onto a folder. Filename/title are preserved so wikilinks still resolve. */
+  async function moveNoteToFolder(docId: string, destFolder: string) {
     if (!pipe || !ready) return;
-    const currentFolder = note.docId.slice(0, note.docId.lastIndexOf('/')) || 'notes';
-    const next = prompt('Move note — destination folder:', currentFolder);
-    if (next === null) return;
+    const note = vault.find((n) => n.docId === docId);
+    if (!note) return;
     const newDocId = moveNotePath(
-      note.docId,
-      next,
+      docId,
+      destFolder || 'notes',
       vault.map((n) => n.docId)
     );
-    if (newDocId === note.docId) return;
-    reindexAs(note.docId, newDocId, note.text);
-    // Persist the path change so the move survives a refresh.
-    await pipe.forgetNote(note.docId);
+    if (newDocId === docId) return;
+    reindexAs(docId, newDocId, note.text);
+    await pipe.forgetNote(docId); // persist the path change so the move survives a refresh
     await pipe.putNote({
       docId: newDocId,
       title: note.title,
@@ -917,10 +993,17 @@
       sourcePath: note.sourcePath,
       frontmatter: note.frontmatter
     });
-    vault = vault.filter((n) => n.docId !== note.docId).concat([{ ...note, docId: newDocId }]);
-    if (activeDoc === note.docId) activeDoc = newDocId;
-    if (editingDocId === note.docId) editingDocId = newDocId;
+    vault = vault.filter((n) => n.docId !== docId).concat([{ ...note, docId: newDocId }]);
+    if (activeDoc === docId) activeDoc = newDocId;
+    if (editingDocId === docId) editingDocId = newDocId;
     editMsg = `✓ moved → ${newDocId}`;
+  }
+
+  async function moveNoteAction(note: Note) {
+    const currentFolder = folderOf(note.docId) || 'notes';
+    const next = prompt('Move note — destination folder:', currentFolder);
+    if (next === null) return;
+    await moveNoteToFolder(note.docId, next);
   }
 
   // Insert a template into the editor body (FR-NOTE-006), expanding {{date}}/{{title}}/… for now.
@@ -1014,12 +1097,18 @@
       const m = modelById(id);
       const msg = err instanceof Error ? err.message : String(err);
       modelId = loadedModel || DEFAULT_MODEL_ID;
-      // Distinguish a DOWNLOAD failure (network / HuggingFace 503 / Cache.add) from a real GPU OOM.
-      // The old code blamed every failure on the buffer cap — misleading during a host outage, where
-      // the right action is "retry" (cached shards resume), not "pick a smaller model".
+      // Classify the failure so the guidance is actionable. The old code blamed EVERY failure on the
+      // WebGPU buffer cap ("pick a smaller model") — wrong for a network hiccup or a browser-STORAGE
+      // limit (e.g. "Failed to read large IndexedDB value" in a private window / quota-capped
+      // browser), where the right move is "retry" or "free space", not "downgrade the model".
+      const isStorage = /indexeddb|quota|storage|read large|disk|no ?space/i.test(msg);
       const isDownload =
         /cache|network|fetch|failed to execute 'add'|http|50\d|429|timeout|load/i.test(msg);
-      if (isDownload) {
+      if (isStorage) {
+        status =
+          `⚠ ${m?.label ?? 'model'} couldn't be cached — the browser's storage rejected the weights ` +
+          `(often a private window or a low storage quota). Use a normal window, free disk space, then retry. [${msg}]`;
+      } else if (isDownload) {
         status =
           `⚠ ${m?.label ?? 'model'} download didn't finish — the model host (HuggingFace) may be ` +
           `busy/rate-limiting. Wait a moment and retry; already-downloaded parts resume. [${msg}]`;
@@ -1035,6 +1124,7 @@
     loadPhase = '';
     loadedModel = id;
     modelCached = true;
+    cachedModels = new Set(cachedModels).add(id); // it's now on disk → keep the gate's badge current
     return true;
   }
 
@@ -1050,12 +1140,266 @@
     }
   }
 
-  /** Switch to the recommended model for this GPU and preload it. */
+  /** Switch to the recommended model for this GPU and warm it up (load + auto-build the graph). */
   async function useRecommended() {
     const rec = recommendModel(!!gpu?.ok);
     if (!rec) return;
     modelId = rec.id;
+    await warmStartup();
+  }
+
+  /**
+   * After the chat model is ready, auto-extract the vault graph ONCE so the Graph tab shows a
+   * visualization without a manual "build graph" click. The incremental hash guard (graphHash)
+   * makes repeat startups cheap — only changed notes are re-read; note edits keep the graph fresh
+   * on their own via the background index queue. No-op if a graph already exists or no model loaded.
+   */
+  async function autoBuildGraphIfNeeded() {
+    if (!pipe || !ready || graphBusy) return;
+    if (!loadedModel) return; // nothing to extract WITH yet
+    if (vault.length === 0 || entityIndex.length > 0) return; // empty vault, or graph already built
+    await buildVaultGraph();
+  }
+
+  /** Startup warm-up: load the chosen model in the background, THEN auto-build the entity graph. */
+  async function warmStartup() {
     await preloadModel();
+    await autoBuildGraphIfNeeded();
+  }
+
+  // --- Startup model gate (FR-MDL-005) -------------------------------------
+  // The first-run "pick a model to warm up" overlay. Choosing one persists the choice and starts a
+  // BACKGROUND warm-up immediately (download + load + build the graph), so the moment the user opens
+  // the Graph tab or Asks, everything is ready.
+  function startBackgroundLoad() {
+    if (pipe && ready) void warmStartup();
+    else wantBackgroundLoad = true; // onMount fires it once the pipeline finishes initializing
+  }
+  function closeModelGate() {
+    modelGate = false;
+    uiPrefs.setOnboarded(true);
+  }
+  function chooseModel(id: string) {
+    modelId = id;
+    uiPrefs.setModelPref(id);
+    // Picking a large model in the gate IS the OOM acknowledgment — don't re-confirm at load time.
+    if (needsOomAck(id)) ackedModels = new Set(ackedModels).add(id);
+    closeModelGate();
+    startBackgroundLoad();
+  }
+  function chooseAutoModel() {
+    const rec = recommendModel(!!gpu?.ok);
+    if (rec) chooseModel(rec.id);
+    else closeModelGate(); // no WebGPU → no chat model to warm; semantic search still works
+  }
+  function reopenModelGate() {
+    modelGate = true;
+    void refreshModelCacheStatus(); // so the gate shows which models are already on disk
+  }
+
+  /** Probe which catalog models are already downloaded to this browser → drives the "on disk" badge
+   *  and the delete button in the gate (FR-MDL). Best-effort; an unknown status just shows the size. */
+  async function refreshModelCacheStatus() {
+    if (!pipe) return;
+    const cached = new Set<string>();
+    await Promise.all(
+      MODELS.map(async (m) => {
+        if (await pipe!.provider.isCached(m.id).catch(() => false)) cached.add(m.id);
+      })
+    );
+    cachedModels = cached;
+  }
+
+  /** Delete a model's weights from this browser to free disk (FR-MDL). Re-downloadable anytime. */
+  async function deleteModelFromCache(id: string) {
+    if (!pipe || deletingModel) return;
+    const m = modelById(id);
+    if (
+      !confirm(
+        `Remove ${m?.label ?? id} from this browser? Frees ~${formatSize(m?.sizeMB ?? 0)} of disk; ` +
+          `you can re-download it anytime.`
+      )
+    )
+      return;
+    deletingModel = id;
+    try {
+      await pipe.provider.deleteModel(id);
+      const next = new Set(cachedModels);
+      next.delete(id);
+      cachedModels = next;
+      if (loadedModel === id) loadedModel = ''; // it's gone from disk; the in-memory copy (if any) stays until reload
+      status = `🗑 removed ${m?.label ?? id} from this browser`;
+    } catch (e) {
+      status = `could not remove ${m?.label ?? id}: ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      deletingModel = '';
+    }
+  }
+
+  // --- File-tree mutations: context menu + folder CRUD + drag-drop (FR-NAV-002) ----
+  function persistFolders() {
+    emptyFolders = [...new Set(emptyFolders)].filter(Boolean).sort();
+    uiPrefs.setEmptyFolders(emptyFolders);
+  }
+  function openCtxMenu(e: MouseEvent, kind: 'file' | 'folder' | 'root', path: string) {
+    e.preventDefault();
+    e.stopPropagation();
+    ctxMenu = { x: e.clientX, y: e.clientY, kind, path };
+  }
+  const closeCtxMenu = () => (ctxMenu = null);
+
+  /** New note targeted at `folder` — opens the editor with that folder pre-filled (FR-NOTE-007). */
+  function newNoteIn(folder: string) {
+    closeCtxMenu();
+    startNewNote();
+    draftFolder = folder || 'notes';
+  }
+
+  /** Create a new EMPTY sub-folder under `parent`, tracked in ui-prefs so it persists while empty. */
+  function newFolderIn(parent: string) {
+    closeCtxMenu();
+    const name = prompt('New folder name:', 'untitled');
+    if (name === null || !name.trim()) return;
+    const path = deriveChildFolder(
+      parent,
+      name,
+      allFolders(
+        vault.map((n) => n.docId),
+        emptyFolders
+      )
+    );
+    emptyFolders = [...emptyFolders, path];
+    persistFolders();
+    if (parent && collapsed.has(parent)) toggleFolder(parent); // reveal the new child
+  }
+
+  /** Append a numeric suffix to a colliding path (`a/b.md` → `a/b-2.md`, `a/b-2.md` → `a/b-3.md`). */
+  function bumpPath(path: string): string {
+    const slash = path.lastIndexOf('/');
+    const dir = slash >= 0 ? path.slice(0, slash) : '';
+    const file = slash >= 0 ? path.slice(slash + 1) : path;
+    const dot = file.lastIndexOf('.');
+    const base = dot > 0 ? file.slice(0, dot) : file;
+    const ext = dot > 0 ? file.slice(dot) : '';
+    const m = base.match(/^(.*)-(\d+)$/);
+    const next = m ? `${m[1]}-${Number(m[2]) + 1}` : `${base}-2`;
+    return `${dir ? dir + '/' : ''}${next}${ext}`;
+  }
+
+  /** Re-key every note under `oldFolder` to `newFolder` (a prefix swap) + fix empty-folder bookkeeping. */
+  async function moveFolderContents(oldFolder: string, newFolder: string) {
+    if (!pipe) return;
+    const taken = new Set(vault.map((n) => n.docId));
+    const moves: { from: string; to: string }[] = [];
+    for (const note of vault) {
+      if (!isUnder(note.docId, oldFolder)) continue;
+      let dest = repathUnderFolder(note.docId, oldFolder, newFolder);
+      taken.delete(note.docId);
+      while (taken.has(dest)) dest = bumpPath(dest);
+      taken.add(dest);
+      if (dest !== note.docId) moves.push({ from: note.docId, to: dest });
+    }
+    for (const m of moves) {
+      const note = vault.find((n) => n.docId === m.from);
+      if (!note) continue;
+      reindexAs(m.from, m.to, note.text);
+      await pipe.forgetNote(m.from);
+      await pipe.putNote({
+        docId: m.to,
+        title: note.title,
+        body: note.text,
+        aliases: note.aliases,
+        kind: note.kind,
+        sourcePath: note.sourcePath,
+        frontmatter: note.frontmatter
+      });
+    }
+    const moveMap = new Map(moves.map((m) => [m.from, m.to]));
+    vault = vault.map((n) => (moveMap.has(n.docId) ? { ...n, docId: moveMap.get(n.docId)! } : n));
+    for (const m of moves) {
+      if (activeDoc === m.from) activeDoc = m.to;
+      if (editingDocId === m.from) editingDocId = m.to;
+    }
+    // Carry the folder's own (possibly empty) bookkeeping across, and ensure the destination exists.
+    emptyFolders = emptyFolders.map((f) =>
+      isUnder(f, oldFolder) ? repathUnderFolder(f, oldFolder, newFolder) : f
+    );
+    if (!emptyFolders.includes(newFolder) && moves.length === 0)
+      emptyFolders = [...emptyFolders, newFolder];
+    persistFolders();
+  }
+
+  async function renameFolder(folder: string) {
+    closeCtxMenu();
+    if (!pipe || !ready) return;
+    const cur = folder.slice(folder.lastIndexOf('/') + 1);
+    const next = prompt(`Rename folder "${folder}":`, cur);
+    if (next === null || !next.trim()) return;
+    const dest = renamedFolderPath(folder, next);
+    if (dest === folder) return;
+    await moveFolderContents(folder, dest);
+    editMsg = `✓ renamed folder → ${dest}`;
+  }
+
+  async function deleteFolder(folder: string) {
+    closeCtxMenu();
+    if (!pipe || !ready) return;
+    const inside = notesUnderFolder(
+      vault.map((n) => n.docId),
+      folder
+    );
+    if (
+      inside.length &&
+      !confirm(
+        `Delete folder "${folder}" and its ${inside.length} note(s)?\nThis removes them from the vault and the search index.`
+      )
+    )
+      return;
+    for (const docId of inside) await removeNoteCompletely(docId);
+    emptyFolders = emptyFolders.filter((f) => f !== folder && !f.startsWith(folder + '/'));
+    persistFolders();
+    vault = vault.filter((n) => !inside.includes(n.docId));
+    if (activeDoc && inside.includes(activeDoc)) {
+      activeDoc = null;
+      activeSpan = null;
+    }
+    void refreshEntities();
+    editMsg = `🗑 deleted folder ${folder}`;
+  }
+
+  // Drag a note from the tree onto a folder to move it (HTML5 drag-and-drop).
+  function onTreeDragStart(e: DragEvent, docId: string) {
+    dragDocId = docId;
+    e.dataTransfer?.setData('text/plain', docId);
+    if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
+  }
+  function onTreeDragOverFolder(e: DragEvent, folder: string) {
+    if (!dragDocId) return; // only react to an internal note drag, not a file-ingestion drop
+    e.preventDefault();
+    e.stopPropagation();
+    dropFolder = folder;
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+  }
+  function onTreeDropFolder(e: DragEvent, folder: string) {
+    if (!dragDocId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const docId = dragDocId;
+    dragDocId = null;
+    dropFolder = null;
+    if (folderOf(docId) !== folder) void moveNoteToFolder(docId, folder);
+  }
+  function onTreeDragEnd() {
+    dragDocId = null;
+    dropFolder = null;
+  }
+  function switchView(v: 'files' | 'graph') {
+    rightView = v;
+    uiPrefs.setView(v);
+    closeCtxMenu();
+    // Entering the Graph tab with a built graph but nothing selected → open the top entity so a
+    // node-link visualization shows immediately, instead of an empty "pick an entity" canvas.
+    if (v === 'graph' && !selectedEntity && entityIndex.length) void openEntity(entityIndex[0]);
   }
 
   async function ask() {
@@ -1175,11 +1519,14 @@
     if (!target) return;
     activeDoc = target.docId;
     activeSpan = { charStart: target.charStart, charEnd: target.charEnd };
+    rightView = 'files'; // Magic Jump lands on the cited note in the doc panel
   }
 
   function showSource(docId: string) {
     activeDoc = docId;
     activeSpan = null;
+    rightView = 'files'; // ensure the note is visible (beside the tree), not hidden behind Graph view
+    closeCtxMenu();
   }
 
   function exportVault() {
@@ -1294,7 +1641,22 @@
   }
 
   // --- File tree + tag pane (FR-NAV-002/003) -------------------------------
-  const fileTree = $derived<TreeNode[]>(buildFileTree(vault.map((n) => n.docId)));
+  const fileTree = $derived<TreeNode[]>(
+    buildFileTree(
+      vault.map((n) => n.docId),
+      emptyFolders
+    )
+  );
+  // Graph view (Phase 4 visual): the selected entity's neighbourhood laid out as a node-link diagram,
+  // and the entity list filtered by the search box.
+  const entityLayout = $derived<GraphLayout | null>(
+    entityGraph ? layoutEntityGraph(entityGraph) : null
+  );
+  const filteredEntities = $derived(
+    entityQuery.trim()
+      ? entityIndex.filter((e) => e.name.toLowerCase().includes(entityQuery.trim().toLowerCase()))
+      : entityIndex
+  );
   const taggedVault = $derived(
     vault.map((n) => ({
       docId: n.docId,
@@ -1387,6 +1749,7 @@
     } else if (e.key === 'Escape') {
       switcherOpen = false;
       wlState = null;
+      ctxMenu = null;
     }
   }
 </script>
@@ -1406,6 +1769,13 @@
       title="Export the vault as a portable .zip — .md proxies + original binaries (FR-DATA-006)"
     >
       ⤓ Export Vault
+    </button>
+    <button
+      class="eject"
+      onclick={reopenModelGate}
+      title="Choose / switch the local AI model to warm up"
+    >
+      🧠 {modelById(modelId)?.label ?? 'Model'}
     </button>
     {#if bgPending > 0}
       <span class="bg-index" title="Notes are saved instantly; embedding runs in the background.">
@@ -1532,7 +1902,7 @@
                   >
                 {/if}
               {:else}
-                <button class="mini accent" onclick={preloadModel} disabled={busy}
+                <button class="mini accent" onclick={warmStartup} disabled={busy}
                   >⬇ Load {modelById(modelId)?.label ?? 'model'} ({formatSize(
                     modelById(modelId)?.sizeMB ?? 0
                   )})</button
@@ -1836,6 +2206,23 @@
       ondrop={onDrop}
     >
       <div class="toolbar">
+        <div class="viewswitch" role="tablist" aria-label="Workspace view">
+          <button
+            class="vbtn"
+            class:on={rightView === 'files'}
+            role="tab"
+            aria-selected={rightView === 'files'}
+            onclick={() => switchView('files')}>📁 Files</button
+          >
+          <button
+            class="vbtn"
+            class:on={rightView === 'graph'}
+            role="tab"
+            aria-selected={rightView === 'graph'}
+            title="Entities + how they connect, as a graph"
+            onclick={() => switchView('graph')}>🕸 Graph</button
+          >
+        </div>
         <button class="addfiles newnote" onclick={startNewNote} disabled={!ready}>
           ✎ New note
         </button>
@@ -1845,7 +2232,6 @@
         <button class="addfiles" onclick={() => fileInput?.click()} disabled={!ready}>
           ＋ Add files
         </button>
-        <span class="hint">Write a note · or drop PDF · CSV · TXT · MD anywhere here</span>
         {#if importMsg}<span class="importmsg">{importMsg}</span>{/if}
       </div>
       <input
@@ -1857,186 +2243,296 @@
         onchange={(e) => ingestFiles((e.currentTarget as HTMLInputElement).files)}
       />
 
-      {#if activeNote}
-        <div class="block-h">
-          {activeNote.docId}{activeSpan ? ' · cited span highlighted' : ''}
-          {#if activeNote.kind}<span class="badge">{activeNote.kind}</span>{/if}
-          <span class="note-actions">
-            {#if !activeNote.sourcePath}
-              <button class="back edit" onclick={() => editNote(activeNote)}>✎ Edit</button>
-              <button class="back" onclick={() => renameNoteAction(activeNote)}>✏️ Rename</button>
-            {/if}
-            <button class="back" onclick={() => moveNoteAction(activeNote)}>📂 Move</button>
-            <button class="back danger" onclick={() => deleteNote(activeNote.docId)}
-              >🗑 Delete</button
-            >
-            <button class="back" onclick={() => (activeDoc = null)}>✕ vault</button>
-          </span>
-        </div>
-        {#if activeNote.sourcePath}
-          <div class="source-link">
-            📎 source: {activeNote.sourcePath} — original preserved, never edited
-          </div>
-        {/if}
-        {#if activeSpan}
-          {@const seg = buildHighlightSegments(
-            activeNote.text,
-            activeSpan.charStart,
-            activeSpan.charEnd
-          )}
-          <article class="doc">{seg.pre}<mark>{seg.hit}</mark>{seg.post}</article>
-        {:else}
-          <!-- Rendered Markdown preview (FR-UI-002). Output is escape-first/safe (ADR-016);
-               wikilink clicks/keys are delegated to vault navigation. -->
-          <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-          <article
-            class="doc rendered"
-            onclick={onRenderedClick}
-            onkeydown={(e) => e.key === 'Enter' && onRenderedClick(e as unknown as MouseEvent)}
-            role="document"
+      <div class="workspace">
+        {#if rightView === 'files'}
+          <!-- Folder sidebar — ALWAYS present; opening a note fills the doc panel BESIDE it. -->
+          <aside
+            class="tree-aside"
+            class:drop={dropFolder === ''}
+            ondragover={(e) => onTreeDragOverFolder(e, '')}
+            ondragleave={() => {
+              if (dropFolder === '') dropFolder = null;
+            }}
+            ondrop={(e) => onTreeDropFolder(e, '')}
           >
-            {@html renderMarkdown(activeNote.text, { resolveLink: resolveNoteLink })}
-          </article>
-        {/if}
-
-        {#if activeBacklinks.length || activeUnlinked.length}
-          <div class="links-panel">
-            {#if activeBacklinks.length}
-              <div class="block-h">🔗 Backlinks — {activeBacklinks.length}</div>
-              {#each activeBacklinks as bl (bl.docId)}
-                <button class="src" onclick={() => showSource(bl.docId)}>
-                  {bl.title}
-                  <span class="score">{bl.count > 1 ? `×${bl.count}` : ''} {bl.docId}</span>
-                </button>
-              {/each}
-            {/if}
-            {#if activeUnlinked.length}
-              <div class="block-h">💭 Unlinked mentions — {activeUnlinked.length}</div>
-              {#each activeUnlinked as um (um.docId)}
-                <button class="src" onclick={() => showSource(um.docId)}>
-                  <span class="src-n">{um.title}</span>
-                  <span class="um-snippet">{um.snippet}</span>
-                </button>
-              {/each}
-            {/if}
-          </div>
-        {/if}
-      {:else if selectedEntity}
-        <!-- Entity page (Phase 2 + 4): the entity's notes + a multi-hop graph over the PERSISTED graph -->
-        <div class="doc-head">
-          <div class="doc-title">
-            🕸 {selectedEntity.name}
-            <span class="badge">{selectedEntity.type}</span>
-            <span class="score">{selectedEntity.noteCount} notes</span>
-          </div>
-          <button class="back" onclick={closeEntity}>✕ close</button>
-        </div>
-        {#if graphBusy}
-          <div class="loading-banner">
-            <span class="spinner"></span><span>traversing graph…</span>
-          </div>
-        {/if}
-        {#if entityGraph && entityGraph.edges.length}
-          <div class="micromap">
             <div class="block-h">
-              Connections · {entityGraph.nodes.length - 1} entities within 2 hops
-            </div>
-            {#each entityGraph.edges as e (e.from + e.to + e.label)}
-              {@const fromN = entityGraph.nodes.find((n) => n.id === e.from)}
-              {@const toN = entityGraph.nodes.find((n) => n.id === e.to)}
-              <div class="rel-row">
-                <button class="tagchip" onclick={() => openEntityById(e.from)}
-                  >{fromN?.label ?? e.from}</button
-                >
-                <span class="rel-type">{e.label.replace(/_/g, ' ')}</span>
-                <button class="tagchip" onclick={() => openEntityById(e.to)}
-                  >{toN?.label ?? e.to}</button
-                >
-              </div>
-            {/each}
-          </div>
-        {:else if !graphBusy}
-          <div class="hint">No relations extracted for this entity yet.</div>
-        {/if}
-        {#if entityNotes.length}
-          <div class="block-h">
-            📄 Notes mentioning {selectedEntity.name} — {entityNotes.length}
-          </div>
-          {#each entityNotes as docId (docId)}
-            <button class="src" onclick={() => showSource(docId)}>
-              <span class="src-n">{docId}</span>
-            </button>
-          {/each}
-        {/if}
-      {:else}
-        <!-- Entities pane (Phase 2): browse the knowledge graph like the Tag pane, but for the
-             people/orgs/concepts the LLM extracted at ingest. Click one to open its entity page. -->
-        <div class="block-h">
-          🕸 Entities{#if entityIndex.length}
-            — {entityIndex.length}{/if}
-          <button class="back" onclick={buildVaultGraph} disabled={graphBusy}
-            >{graphBusy
-              ? 'extracting…'
-              : entityIndex.length
-                ? '↻ rebuild'
-                : '✨ build graph'}</button
-          >
-        </div>
-        {#if entityIndex.length}
-          <div class="tagbar">
-            {#each entityIndex.slice(0, 40) as e (e.id)}
-              <button class="tagchip" onclick={() => openEntity(e)} title={e.type}
-                >{e.name} <span class="tagcount">{e.noteCount}</span></button
-              >
-            {/each}
-          </div>
-        {:else}
-          <div class="hint">
-            No entity graph yet. Click “build graph” — it loads a chat model, reads your notes, and
-            extracts the people/orgs/concepts + how they connect, so GraphRAG can use them.
-          </div>
-        {/if}
-
-        {#if tagIndex.length}
-          <div class="block-h">🏷 Tags</div>
-          <div class="tagbar">
-            {#each tagIndex as t (t.tag)}
+              📁 Vault — {vault.length}
               <button
-                class="tagchip"
-                class:active={activeTag === t.tag}
-                onclick={() => toggleTag(t.tag)}
-                >#{t.tag} <span class="tagcount">{t.count}</span></button
+                class="back"
+                title="New note / new folder"
+                onclick={(e) => openCtxMenu(e, 'root', '')}>＋ New</button
               >
-            {/each}
-          </div>
-        {/if}
-
-        {#if activeTag}
-          <div class="block-h">
-            Tagged #{activeTag} — {filteredNotes.length}
-            <button class="back" onclick={() => (activeTag = null)}>✕ clear</button>
-          </div>
-          {#each filteredNotes as note (note.docId)}
-            <button class="note" onclick={() => showSource(note.docId)}>
-              <div class="note-title">
-                {note.docId}
-                {#if note.kind}<span class="badge">{note.kind}</span>{/if}
+            </div>
+            {#if activeTag}
+              <div class="block-h">
+                #{activeTag} — {filteredNotes.length}
+                <button class="back" onclick={() => (activeTag = null)}>✕ clear</button>
               </div>
-              <div class="note-body">{note.text}</div>
-            </button>
-          {/each}
+              {#each filteredNotes as note (note.docId)}
+                <button
+                  class="tree-file"
+                  class:active={activeDoc === note.docId}
+                  onclick={() => showSource(note.docId)}
+                  oncontextmenu={(e) => openCtxMenu(e, 'file', note.docId)}
+                >
+                  📄 {shortName(note.docId)}{#if note.kind}<span class="badge">{note.kind}</span
+                    >{/if}
+                </button>
+              {/each}
+            {:else}
+              {@render treeView(fileTree)}
+            {/if}
+            {#if tagIndex.length}
+              <div class="block-h tags-h">🏷 Tags</div>
+              <div class="tagbar">
+                {#each tagIndex as t (t.tag)}
+                  <button
+                    class="tagchip"
+                    class:active={activeTag === t.tag}
+                    onclick={() => toggleTag(t.tag)}
+                    >#{t.tag} <span class="tagcount">{t.count}</span></button
+                  >
+                {/each}
+              </div>
+            {/if}
+          </aside>
+
+          <!-- Doc panel — the open note, beside the tree (it never replaces the tree). -->
+          <div class="docpane">
+            {#if activeNote}
+              <div class="block-h">
+                {activeNote.docId}{activeSpan ? ' · cited span highlighted' : ''}
+                {#if activeNote.kind}<span class="badge">{activeNote.kind}</span>{/if}
+                <span class="note-actions">
+                  {#if !activeNote.sourcePath}
+                    <button class="back edit" onclick={() => editNote(activeNote)}>✎ Edit</button>
+                    <button class="back" onclick={() => renameNoteAction(activeNote)}
+                      >✏️ Rename</button
+                    >
+                  {/if}
+                  <button class="back" onclick={() => moveNoteAction(activeNote)}>📂 Move</button>
+                  <button class="back danger" onclick={() => deleteNote(activeNote.docId)}
+                    >🗑 Delete</button
+                  >
+                  <button class="back" onclick={() => (activeDoc = null)}>✕ close</button>
+                </span>
+              </div>
+              {#if activeNote.sourcePath}
+                <div class="source-link">
+                  📎 source: {activeNote.sourcePath} — original preserved, never edited
+                </div>
+              {/if}
+              {#if activeSpan}
+                {@const seg = buildHighlightSegments(
+                  activeNote.text,
+                  activeSpan.charStart,
+                  activeSpan.charEnd
+                )}
+                <article class="doc">{seg.pre}<mark>{seg.hit}</mark>{seg.post}</article>
+              {:else}
+                <!-- Rendered Markdown preview (FR-UI-002). Output is escape-first/safe (ADR-016);
+                     wikilink clicks/keys are delegated to vault navigation. -->
+                <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+                <article
+                  class="doc rendered"
+                  onclick={onRenderedClick}
+                  onkeydown={(e) =>
+                    e.key === 'Enter' && onRenderedClick(e as unknown as MouseEvent)}
+                  role="document"
+                >
+                  {@html renderMarkdown(activeNote.text, { resolveLink: resolveNoteLink })}
+                </article>
+              {/if}
+
+              {#if activeBacklinks.length || activeUnlinked.length}
+                <div class="links-panel">
+                  {#if activeBacklinks.length}
+                    <div class="block-h">🔗 Backlinks — {activeBacklinks.length}</div>
+                    {#each activeBacklinks as bl (bl.docId)}
+                      <button class="src" onclick={() => showSource(bl.docId)}>
+                        {bl.title}
+                        <span class="score">{bl.count > 1 ? `×${bl.count}` : ''} {bl.docId}</span>
+                      </button>
+                    {/each}
+                  {/if}
+                  {#if activeUnlinked.length}
+                    <div class="block-h">💭 Unlinked mentions — {activeUnlinked.length}</div>
+                    {#each activeUnlinked as um (um.docId)}
+                      <button class="src" onclick={() => showSource(um.docId)}>
+                        <span class="src-n">{um.title}</span>
+                        <span class="um-snippet">{um.snippet}</span>
+                      </button>
+                    {/each}
+                  {/if}
+                </div>
+              {/if}
+            {:else}
+              <div class="empty-doc">
+                <div class="empty-emoji">📄</div>
+                <p>
+                  Select a note from the tree, or
+                  <button class="linklike" onclick={startNewNote}>write a new one</button>.
+                </p>
+                <p class="hint">
+                  Right-click the tree to add · rename · move · delete · new folder. Drag a note
+                  onto a folder to move it.
+                </p>
+              </div>
+            {/if}
+          </div>
         {:else}
-          <div class="block-h">📁 Vault — {vault.length} notes</div>
-          {@render treeView(fileTree)}
+          <!-- Graph view: the entity list + a node-link graph of the selected entity's neighbourhood. -->
+          <aside class="tree-aside">
+            <div class="block-h">
+              🕸 Entities{#if entityIndex.length}
+                — {entityIndex.length}{/if}
+              <button class="back" onclick={buildVaultGraph} disabled={graphBusy}
+                >{graphBusy
+                  ? 'extracting…'
+                  : entityIndex.length
+                    ? '↻ rebuild'
+                    : '✨ build graph'}</button
+              >
+            </div>
+            {#if entityIndex.length}
+              <input
+                class="entity-search"
+                bind:value={entityQuery}
+                placeholder="Filter entities…"
+                aria-label="Filter entities"
+              />
+              <div class="entity-list">
+                {#each filteredEntities as e (e.id)}
+                  <button
+                    class="entity-item"
+                    class:active={selectedEntity?.id === e.id}
+                    onclick={() => openEntity(e)}
+                    title={e.type}
+                  >
+                    <span class="dot" style="background:{entityColor(e.type)}"></span>
+                    <span class="entity-name">{e.name}</span>
+                    <span class="tagcount">{e.noteCount}</span>
+                  </button>
+                {:else}
+                  <div class="hint">No entity matches “{entityQuery}”.</div>
+                {/each}
+              </div>
+            {:else}
+              <div class="hint">
+                No entity graph yet. Click “build graph” — it loads a chat model, reads your notes,
+                and extracts the people/orgs/concepts + how they connect, so GraphRAG can use them.
+              </div>
+            {/if}
+          </aside>
+
+          <div class="graphpane">
+            {#if graphBusy}
+              <div class="loading-banner">
+                <span class="spinner"></span><span>traversing graph…</span>
+              </div>
+            {:else if selectedEntity && entityLayout}
+              <div class="doc-head">
+                <div class="doc-title">
+                  <span class="dot lg" style="background:{entityColor(selectedEntity.type)}"></span>
+                  {selectedEntity.name}
+                  <span class="badge">{selectedEntity.type}</span>
+                  <span class="score">{selectedEntity.noteCount} notes</span>
+                </div>
+                <button class="back" onclick={closeEntity}>✕ close</button>
+              </div>
+              {#if entityLayout.nodes.length > 1}
+                <svg
+                  class="entity-graph"
+                  viewBox="0 0 {entityLayout.width} {entityLayout.height}"
+                  role="img"
+                  aria-label="Entity relationship graph for {selectedEntity.name}"
+                >
+                  {#each entityLayout.edges as e (e.from + '|' + e.to + '|' + e.label)}
+                    <line
+                      x1={e.x1}
+                      y1={e.y1}
+                      x2={e.x2}
+                      y2={e.y2}
+                      stroke="#c9c2e6"
+                      stroke-width="1.5"
+                    />
+                    <text x={e.mx} y={e.my} class="edge-label" text-anchor="middle"
+                      >{e.label.replace(/_/g, ' ')}</text
+                    >
+                  {/each}
+                  {#each entityLayout.nodes as n (n.id)}
+                    <!-- svelte-ignore a11y_click_events_have_key_events -->
+                    <g
+                      class="g-node"
+                      class:center={n.hop === 0}
+                      role="button"
+                      tabindex="0"
+                      onclick={() => n.hop !== 0 && openEntityById(n.id)}
+                      onkeydown={(ev) => ev.key === 'Enter' && n.hop !== 0 && openEntityById(n.id)}
+                    >
+                      <circle
+                        cx={n.x}
+                        cy={n.y}
+                        r={n.r}
+                        fill={entityColor(n.type)}
+                        stroke="#fff"
+                        stroke-width="2"
+                      />
+                      <text x={n.x} y={n.y + n.r + 12} class="node-label" text-anchor="middle"
+                        >{n.label}</text
+                      >
+                    </g>
+                  {/each}
+                </svg>
+              {:else}
+                <div class="hint">
+                  No relations extracted for {selectedEntity.name} yet — the model found this entity but
+                  not how it connects. Try
+                  <button class="linklike" onclick={buildVaultGraph}>↻ rebuild the graph</button>
+                  with a stronger model (e.g. Qwen2.5-3B) to map connections.
+                </div>
+              {/if}
+              {#if entityNotes.length}
+                <div class="block-h">
+                  📄 Notes mentioning {selectedEntity.name} — {entityNotes.length}
+                </div>
+                {#each entityNotes as docId (docId)}
+                  <button class="src" onclick={() => showSource(docId)}>
+                    <span class="src-n">{docId}</span>
+                  </button>
+                {/each}
+              {/if}
+            {:else}
+              <div class="empty-doc">
+                <div class="empty-emoji">🕸</div>
+                <p>Pick an entity to see how it connects across your vault.</p>
+                {#if !entityIndex.length}
+                  <p class="hint">
+                    Build the graph first — it extracts entities and relations from your notes.
+                  </p>
+                {/if}
+              </div>
+            {/if}
+          </div>
         {/if}
-      {/if}
+      </div>
     </section>
   </div>
 
   {#snippet treeView(nodes: TreeNode[])}
     {#each nodes as node (node.path)}
       {#if node.kind === 'folder'}
-        <button class="tree-folder" onclick={() => toggleFolder(node.path)}>
+        <button
+          class="tree-folder"
+          class:drop={dropFolder === node.path}
+          onclick={() => toggleFolder(node.path)}
+          oncontextmenu={(e) => openCtxMenu(e, 'folder', node.path)}
+          ondragover={(e) => onTreeDragOverFolder(e, node.path)}
+          ondragleave={() => {
+            if (dropFolder === node.path) dropFolder = null;
+          }}
+          ondrop={(e) => onTreeDropFolder(e, node.path)}
+        >
           <span class="tree-caret">{collapsed.has(node.path) ? '▸' : '▾'}</span>📁 {node.name}
         </button>
         {#if !collapsed.has(node.path)}
@@ -2044,7 +2540,16 @@
         {/if}
       {:else}
         {@const kind = vault.find((n) => n.docId === node.docId)?.kind}
-        <button class="tree-file" onclick={() => node.docId && showSource(node.docId)}>
+        <button
+          class="tree-file"
+          class:active={activeDoc === node.docId}
+          class:dragging={dragDocId === node.docId}
+          draggable="true"
+          onclick={() => node.docId && showSource(node.docId)}
+          oncontextmenu={(e) => openCtxMenu(e, 'file', node.docId ?? '')}
+          ondragstart={(e) => node.docId && onTreeDragStart(e, node.docId)}
+          ondragend={onTreeDragEnd}
+        >
           📄 {node.name}{#if kind}<span class="badge">{kind}</span>{/if}
         </button>
       {/if}
@@ -2152,6 +2657,162 @@
           </div>
         {:else}
           <div class="compiler-meta">Nothing to compile.</div>
+        {/if}
+      </div>
+    </div>
+  {/if}
+
+  {#if ctxMenu}
+    <!-- File-tree context menu (FR-NAV-002). A full-screen backdrop closes it on any outside click. -->
+    <div
+      class="ctx-backdrop"
+      role="presentation"
+      onclick={closeCtxMenu}
+      oncontextmenu={(e) => {
+        e.preventDefault();
+        closeCtxMenu();
+      }}
+    ></div>
+    <div class="ctx-menu" style="left:{ctxMenu.x}px; top:{ctxMenu.y}px" role="menu">
+      {#if ctxMenu.kind === 'file'}
+        {@const note = vault.find((n) => n.docId === ctxMenu?.path)}
+        <button class="ctx-item" role="menuitem" onclick={() => note && showSource(note.docId)}
+          >📄 Open</button
+        >
+        {#if note && !note.sourcePath}
+          <button
+            class="ctx-item"
+            role="menuitem"
+            onclick={() => {
+              const n = note;
+              closeCtxMenu();
+              if (n) editNote(n);
+            }}>✎ Edit</button
+          >
+          <button
+            class="ctx-item"
+            role="menuitem"
+            onclick={() => {
+              const n = note;
+              closeCtxMenu();
+              if (n) renameNoteAction(n);
+            }}>✏️ Rename</button
+          >
+        {/if}
+        <button
+          class="ctx-item"
+          role="menuitem"
+          onclick={() => {
+            const n = note;
+            closeCtxMenu();
+            if (n) moveNoteAction(n);
+          }}>📂 Move…</button
+        >
+        <button
+          class="ctx-item danger"
+          role="menuitem"
+          onclick={() => {
+            const p = ctxMenu?.path;
+            closeCtxMenu();
+            if (p) deleteNote(p);
+          }}>🗑 Delete</button
+        >
+      {:else if ctxMenu.kind === 'folder'}
+        <button class="ctx-item" role="menuitem" onclick={() => newNoteIn(ctxMenu?.path ?? 'notes')}
+          >✎ New note here</button
+        >
+        <button class="ctx-item" role="menuitem" onclick={() => newFolderIn(ctxMenu?.path ?? '')}
+          >📁 New folder</button
+        >
+        <button class="ctx-item" role="menuitem" onclick={() => renameFolder(ctxMenu?.path ?? '')}
+          >✏️ Rename folder</button
+        >
+        <button
+          class="ctx-item danger"
+          role="menuitem"
+          onclick={() => deleteFolder(ctxMenu?.path ?? '')}>🗑 Delete folder</button
+        >
+      {:else}
+        <button class="ctx-item" role="menuitem" onclick={() => newNoteIn('notes')}
+          >✎ New note</button
+        >
+        <button class="ctx-item" role="menuitem" onclick={() => newFolderIn('')}
+          >📁 New folder</button
+        >
+      {/if}
+    </div>
+  {/if}
+
+  {#if modelGate}
+    <!-- Startup model gate (FR-MDL-005): pick a model to warm up in the background before Ask/build. -->
+    <div class="switcher-overlay" role="presentation">
+      <div class="gate" role="dialog" aria-modal="true" aria-label="Choose a model">
+        <div class="gate-head">
+          <strong>✦ Warm up a local AI model</strong>
+          <p class="gate-sub">
+            Nebula runs the model on your device. Pick one to load in the background now — so chat
+            and graph-building are ready the moment you need them. It downloads once, then it's
+            cached.
+          </p>
+        </div>
+        {#if gpu?.ok}
+          {@const rec = recommendModel(true)}
+          {#if rec}
+            <button class="gate-auto" onclick={chooseAutoModel}>
+              <span>★ Auto — {rec.label}</span>
+              <small>recommended for your GPU · {formatSize(rec.sizeMB)}</small>
+            </button>
+          {/if}
+          <div class="gate-or">or choose a model</div>
+          <div class="gate-list">
+            {#each MODELS as m (m.id)}
+              {@const cached = cachedModels.has(m.id)}
+              <div class="gate-model" class:current={m.id === modelId} class:cached>
+                <button
+                  class="gate-model-pick"
+                  onclick={() => chooseModel(m.id)}
+                  disabled={deletingModel === m.id}
+                >
+                  <span class="gate-model-label"
+                    >{m.label}{#if m.multilingual}<span class="badge">multi</span>{/if}</span
+                  >
+                  <span class="gate-model-size">
+                    {#if cached}
+                      <span
+                        class="cached-badge"
+                        title="Already downloaded to this browser — loads instantly, no download"
+                        >✓ on disk</span
+                      >
+                    {:else}
+                      {formatSize(m.sizeMB)}{#if needsOomAck(m.id)}<span
+                          class="warn-badge"
+                          title="May exceed the WebGPU per-buffer cap on some GPUs">⚠</span
+                        >{/if}
+                    {/if}
+                  </span>
+                </button>
+                {#if cached}
+                  <button
+                    class="gate-model-del"
+                    title="Remove {m.label} from this browser (free ~{formatSize(m.sizeMB)})"
+                    aria-label="Remove {m.label} from this browser"
+                    onclick={() => deleteModelFromCache(m.id)}
+                    disabled={!!deletingModel}>{deletingModel === m.id ? '…' : '🗑'}</button
+                  >
+                {/if}
+              </div>
+            {/each}
+          </div>
+          <button class="gate-skip" onclick={closeModelGate}
+            >Skip for now — semantic search, notes &amp; graph still work</button
+          >
+        {:else}
+          <div class="gate-nowebgpu">
+            ⚠ No WebGPU detected — on-device chat/generation is unavailable here, but semantic
+            search, notes, and the file tree all work. Use Chrome or Edge on a GPU-capable device to
+            enable chat.
+          </div>
+          <button class="gate-skip" onclick={closeModelGate}>Continue</button>
         {/if}
       </div>
     </div>
@@ -2318,6 +2979,7 @@
     display: flex;
     align-items: center;
     gap: 0.5rem;
+    flex-wrap: wrap; /* in the narrower doc panel, let note-action buttons wrap instead of clipping */
   }
   .back {
     margin-left: auto;
@@ -2329,32 +2991,6 @@
     border-radius: 6px;
     padding: 0.1rem 0.4rem;
     color: #6a6a72;
-  }
-  .note {
-    display: block;
-    width: 100%;
-    text-align: left;
-    cursor: pointer;
-    border: 1px solid #e8e8ee;
-    border-radius: 10px;
-    padding: 0.6rem 0.7rem;
-    margin-bottom: 0.6rem;
-    background: #fff;
-  }
-  .note:hover {
-    border-color: #6750a4;
-  }
-  .note-title {
-    font-weight: 600;
-    font-size: 0.82rem;
-    color: #444;
-  }
-  .note-body {
-    font-size: 0.82rem;
-    color: #555;
-    margin-top: 0.25rem;
-    overflow: hidden;
-    max-height: 3rem;
   }
   .doc {
     font-size: 0.9rem;
@@ -3015,18 +3651,6 @@
     color: #6750a4;
     margin-left: 0.3rem;
   }
-  .rel-row {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    flex-wrap: wrap;
-    padding: 0.18rem 0;
-  }
-  .rel-type {
-    font-size: 0.68rem;
-    color: #79747e;
-    font-style: italic;
-  }
   .tree-folder,
   .tree-file {
     display: block;
@@ -3118,5 +3742,377 @@
     pointer-events: none;
     z-index: 10;
     box-shadow: 0 4px 16px #0003;
+  }
+
+  /* --- Workspace: Files/Graph switch + folder-sidebar | doc/graph layout --- */
+  .viewswitch {
+    display: inline-flex;
+    border: 1px solid #d8d8e0;
+    border-radius: 8px;
+    overflow: hidden;
+    margin-right: 0.3rem;
+  }
+  .vbtn {
+    font-size: 0.78rem;
+    border: 0;
+    background: #fff;
+    color: #6a6a72;
+    padding: 0.25rem 0.6rem;
+    cursor: pointer;
+  }
+  .vbtn.on {
+    background: #6750a4;
+    color: #fff;
+    font-weight: 600;
+  }
+  .workspace {
+    display: flex;
+    gap: 0.7rem;
+    min-height: 0;
+    align-items: stretch;
+  }
+  .tree-aside {
+    flex: 0 0 14rem;
+    max-width: 16rem;
+    overflow: auto;
+    padding-right: 0.6rem;
+    border-right: 1px solid #ececf2;
+  }
+  .tree-aside.drop {
+    background: #faf8ff;
+    outline: 2px dashed #c9c2e6;
+    outline-offset: -4px;
+    border-radius: 8px;
+  }
+  .docpane,
+  .graphpane {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: auto;
+  }
+  .empty-doc {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    gap: 0.4rem;
+    color: #8a8a92;
+    height: 100%;
+    min-height: 14rem;
+    padding: 1rem;
+  }
+  .empty-emoji {
+    font-size: 2.4rem;
+    opacity: 0.55;
+  }
+  .empty-doc p {
+    margin: 0;
+    font-size: 0.86rem;
+    max-width: 26rem;
+  }
+  .empty-doc .hint {
+    font-size: 0.76rem;
+  }
+  .linklike {
+    border: 0;
+    background: none;
+    padding: 0;
+    color: #6750a4;
+    font: inherit;
+    text-decoration: underline;
+    cursor: pointer;
+  }
+  .tree-file.active {
+    background: #efeaf8;
+    color: #6750a4;
+    font-weight: 600;
+  }
+  .tree-file.dragging {
+    opacity: 0.5;
+  }
+  .tree-folder.drop {
+    background: #ece6fb;
+    outline: 2px dashed #6750a4;
+    outline-offset: -2px;
+  }
+  .tags-h {
+    margin-top: 0.9rem;
+  }
+
+  /* --- Graph view: entity list + node-link canvas --- */
+  .entity-search {
+    width: 100%;
+    box-sizing: border-box;
+    border: 1px solid #d8d8e0;
+    border-radius: 7px;
+    padding: 0.3rem 0.45rem;
+    font-size: 0.8rem;
+    margin-bottom: 0.4rem;
+  }
+  .entity-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+  }
+  .entity-item {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    width: 100%;
+    text-align: left;
+    cursor: pointer;
+    border: 0;
+    background: none;
+    border-radius: 6px;
+    padding: 0.25rem 0.4rem;
+    font-size: 0.82rem;
+    color: #2a2a30;
+  }
+  .entity-item:hover {
+    background: #efeaf8;
+  }
+  .entity-item.active {
+    background: #efeaf8;
+    color: #6750a4;
+    font-weight: 600;
+  }
+  .entity-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .dot {
+    flex: 0 0 auto;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    display: inline-block;
+  }
+  .dot.lg {
+    width: 12px;
+    height: 12px;
+  }
+  .entity-graph {
+    width: 100%;
+    height: auto;
+    background: #fcfbff;
+    border: 1px solid #ececf2;
+    border-radius: 10px;
+    margin-bottom: 0.7rem;
+  }
+  .g-node {
+    cursor: pointer;
+  }
+  .g-node.center {
+    cursor: default;
+  }
+  .g-node:focus-visible {
+    outline: none;
+  }
+  .g-node:focus-visible circle {
+    stroke: #1c1c22;
+    stroke-width: 3;
+  }
+  .node-label {
+    font-size: 12px;
+    fill: #2a2a30;
+    pointer-events: none;
+  }
+  .edge-label {
+    font-size: 10px;
+    fill: #79747e;
+    font-style: italic;
+    pointer-events: none;
+  }
+
+  /* --- File-tree context menu --- */
+  .ctx-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 24;
+  }
+  .ctx-menu {
+    position: fixed;
+    z-index: 25;
+    min-width: 9.5rem;
+    background: #fff;
+    border: 1px solid #e0dcec;
+    border-radius: 9px;
+    box-shadow: 0 10px 30px #0003;
+    padding: 0.25rem;
+    display: flex;
+    flex-direction: column;
+  }
+  .ctx-item {
+    text-align: left;
+    border: 0;
+    background: none;
+    border-radius: 6px;
+    padding: 0.35rem 0.55rem;
+    font-size: 0.8rem;
+    color: #2a2a30;
+    cursor: pointer;
+  }
+  .ctx-item:hover {
+    background: #efeaf8;
+  }
+  .ctx-item.danger {
+    color: #b3261e;
+  }
+  .ctx-item.danger:hover {
+    background: #fce8e6;
+  }
+
+  /* --- Startup model gate --- */
+  .gate {
+    width: min(560px, 94vw);
+    max-height: 86vh;
+    overflow: auto;
+    background: #fff;
+    border-radius: 14px;
+    box-shadow: 0 16px 56px #0005;
+    padding: 1.1rem 1.2rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+  }
+  .gate-head strong {
+    font-size: 1.05rem;
+    color: #6750a4;
+  }
+  .gate-sub {
+    margin: 0.3rem 0 0;
+    font-size: 0.84rem;
+    color: #5a5a64;
+    line-height: 1.45;
+  }
+  .gate-auto {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    align-items: flex-start;
+    text-align: left;
+    cursor: pointer;
+    border: 1px solid #d9cef2;
+    background: #6750a4;
+    color: #fff;
+    border-radius: 10px;
+    padding: 0.6rem 0.8rem;
+    font-size: 0.92rem;
+    font-weight: 600;
+  }
+  .gate-auto small {
+    font-weight: 400;
+    opacity: 0.92;
+    font-size: 0.74rem;
+  }
+  .gate-or {
+    font-size: 0.74rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #9a9aa2;
+    text-align: center;
+    margin: 0.1rem 0;
+  }
+  .gate-list {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.4rem;
+  }
+  .gate-model {
+    display: flex;
+    align-items: stretch;
+    border: 1px solid #e4e0ee;
+    background: #fff;
+    border-radius: 9px;
+    overflow: hidden;
+  }
+  .gate-model:hover {
+    border-color: #6750a4;
+  }
+  .gate-model.current {
+    border-color: #6750a4;
+    background: #efeaf8;
+  }
+  .gate-model.cached {
+    border-color: #bfe3c8;
+  }
+  .gate-model-pick {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    align-items: flex-start;
+    text-align: left;
+    cursor: pointer;
+    border: 0;
+    background: none;
+    padding: 0.45rem 0.6rem;
+  }
+  .gate-model-pick:hover {
+    background: #faf8ff;
+  }
+  .gate-model-pick:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .gate-model-label {
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: #2a2a30;
+    display: flex;
+    align-items: center;
+    gap: 0.2rem;
+  }
+  .gate-model-size {
+    font-size: 0.74rem;
+    color: #8a8a92;
+  }
+  .cached-badge {
+    color: #1a7f37;
+    font-weight: 600;
+  }
+  .gate-model-del {
+    flex: 0 0 auto;
+    border: 0;
+    border-left: 1px solid #f0eef6;
+    background: none;
+    color: #b3261e;
+    cursor: pointer;
+    padding: 0 0.5rem;
+    font-size: 0.85rem;
+  }
+  .gate-model-del:hover {
+    background: #fce8e6;
+  }
+  .gate-model-del:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .warn-badge {
+    color: #9a5a00;
+    margin-left: 0.2rem;
+  }
+  .gate-skip {
+    margin-top: 0.2rem;
+    border: 0;
+    background: #f0f0f4;
+    color: #6a6a72;
+    border-radius: 8px;
+    padding: 0.45rem 0.7rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+  }
+  .gate-nowebgpu {
+    font-size: 0.84rem;
+    color: #8a5a00;
+    background: #fff4e0;
+    border-radius: 9px;
+    padding: 0.6rem 0.7rem;
+    line-height: 1.45;
   }
 </style>

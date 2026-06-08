@@ -22,35 +22,44 @@ function sortNodes(nodes: TreeNode[]): void {
 
 /**
  * Build a nested folder tree from a flat list of note paths (FR-NAV-002). Each path's segments
- * become nested folders; the last segment is a file leaf carrying its `docId`. Pure and
- * deterministic: folders before files, both alphabetical.
+ * become nested folders; the last segment is a file leaf carrying its `docId`. `extraFolders` adds
+ * folders that hold no notes yet — the EMPTY folders a user explicitly created (FR-NOTE-007) — so
+ * they still appear in the tree. Pure and deterministic: folders before files, both alphabetical.
  */
-export function buildFileTree(docIds: string[]): TreeNode[] {
+export function buildFileTree(docIds: string[], extraFolders: string[] = []): TreeNode[] {
   const roots: TreeNode[] = [];
   const folderByPath = new Map<string, TreeNode>();
+
+  // Materialize a folder path (and every ancestor), returning its deepest node. Idempotent.
+  const ensureFolder = (path: string): TreeNode | null => {
+    const segs = path.split('/').filter(Boolean);
+    let level = roots;
+    let prefix = '';
+    let node: TreeNode | null = null;
+    for (const seg of segs) {
+      prefix = prefix ? `${prefix}/${seg}` : seg;
+      let folder = folderByPath.get(prefix);
+      if (!folder) {
+        folder = { name: seg, path: prefix, kind: 'folder', children: [] };
+        folderByPath.set(prefix, folder);
+        level.push(folder);
+      }
+      level = folder.children;
+      node = folder;
+    }
+    return node;
+  };
 
   for (const docId of docIds) {
     const segs = docId.split('/').filter(Boolean);
     if (segs.length === 0) continue;
-    let level = roots;
-    let prefix = '';
-    for (let i = 0; i < segs.length; i++) {
-      const seg = segs[i];
-      const isFile = i === segs.length - 1;
-      prefix = prefix ? `${prefix}/${seg}` : seg;
-      if (isFile) {
-        level.push({ name: seg, path: docId, kind: 'file', docId, children: [] });
-      } else {
-        let folder = folderByPath.get(prefix);
-        if (!folder) {
-          folder = { name: seg, path: prefix, kind: 'folder', children: [] };
-          folderByPath.set(prefix, folder);
-          level.push(folder);
-        }
-        level = folder.children;
-      }
-    }
+    const file = segs[segs.length - 1];
+    const parentPath = segs.slice(0, -1).join('/');
+    const level = parentPath ? (ensureFolder(parentPath)?.children ?? roots) : roots;
+    level.push({ name: file, path: docId, kind: 'file', docId, children: [] });
   }
+  for (const folder of extraFolders) ensureFolder(folder);
+
   sortNodes(roots);
   return roots;
 }
