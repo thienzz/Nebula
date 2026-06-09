@@ -13,6 +13,7 @@ const K_MODEL = `${NS}.model`;
 const K_ONBOARDED = `${NS}.onboarded`;
 const K_FOLDERS = `${NS}.emptyFolders`;
 const K_VIEW = `${NS}.view`;
+const K_THEME = `${NS}.theme`;
 
 function store(): Storage | null {
   try {
@@ -87,4 +88,13 @@ export function getView(): WorkspaceView {
 }
 export function setView(view: WorkspaceView): void {
   write(K_VIEW, view);
+}
+
+/** Light/dark theme for the "Clean Slate" design system (data-theme on the root). */
+export type Theme = 'light' | 'dark';
+export function getTheme(): Theme {
+  return read(K_THEME) === 'dark' ? 'dark' : 'light';
+}
+export function setTheme(theme: Theme): void {
+  write(K_THEME, theme);
 }

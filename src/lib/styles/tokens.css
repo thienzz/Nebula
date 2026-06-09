@@ -1,0 +1,226 @@
+/* Nebula design tokens — "Clean Slate" direction (light + dark).
+ * Ported verbatim from the design hand-off (design_handoff_nebula_workspace/app/theme.js).
+ * Toggling [data-theme="dark"] on the root flips the whole app.
+ * NOTE: fonts fall back to system-ui / ui-monospace — Geist / Inter Tight / IBM Plex Mono
+ * are self-hosted in a later pass (no external Google Fonts call: zero-external-calls posture). */
+:root {
+  --bg: #ffffff;
+  --surface: #ffffff;
+  --surface-alt: #fafafb;
+  --sidebar: #f8f9fa;
+  --rail: #fbfbfc;
+  --ink: #13161b;
+  --ink-2: #3a3f48;
+  --muted: #767d88;
+  --faint: #aab0ba;
+  --line: #ededf1;
+  --line-strong: #e0e2e8;
+  --hover: rgba(20, 24, 33, 0.045);
+  --hover-strong: rgba(20, 24, 33, 0.07);
+  --accent: #2f6fdb;
+  --accent-soft: #e9f0fd;
+  --accent-ink: #1d4fa6;
+  --accent-rim: #c9defb;
+  --ok: #1f8a5b;
+  --ok-soft: #e4f4ec;
+  --warn: #b06a12;
+  --warn-soft: #fbeede;
+  --mark: #fff1c2;
+  --mark-ink: #5b4708;
+  --shadow-sm: 0 1px 2px rgba(20, 24, 33, 0.05);
+  --shadow-md: 0 1px 2px rgba(20, 24, 33, 0.04), 0 8px 24px rgba(20, 24, 33, 0.07);
+  --shadow-lg: 0 12px 32px rgba(20, 24, 33, 0.12), 0 2px 8px rgba(20, 24, 33, 0.06);
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 10px;
+  --r-xl: 14px;
+  --r-pill: 999px;
+  --ui: 'Geist', 'Inter Tight', system-ui, -apple-system, sans-serif;
+  --mono: 'IBM Plex Mono', ui-monospace, monospace;
+}
+[data-theme='dark'] {
+  --bg: #0d0f12;
+  --surface: #15171c;
+  --surface-alt: #101216;
+  --sidebar: #101216;
+  --rail: #121419;
+  --ink: #e7e9ee;
+  --ink-2: #bcc1cb;
+  --muted: #878d99;
+  --faint: #5c626d;
+  --line: #22252c;
+  --line-strong: #2e323b;
+  --hover: rgba(255, 255, 255, 0.05);
+  --hover-strong: rgba(255, 255, 255, 0.08);
+  --accent: #5b8def;
+  --accent-soft: #17273f;
+  --accent-ink: #9cbcf6;
+  --accent-rim: #274363;
+  --ok: #3fb27f;
+  --ok-soft: #10271e;
+  --warn: #d39a4e;
+  --warn-soft: #2c2110;
+  --mark: #3a3413;
+  --mark-ink: #e3cf86;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 26px rgba(0, 0, 0, 0.5);
+  --shadow-lg: 0 16px 40px rgba(0, 0, 0, 0.6), 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  height: 100%;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--ui);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+::selection {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+.nb-app * {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-strong) transparent;
+}
+.nb-app *::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.nb-app *::-webkit-scrollbar-thumb {
+  background: var(--line-strong);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+.nb-app *::-webkit-scrollbar-track {
+  background: transparent;
+}
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+kbd {
+  font-family: var(--mono);
+}
+.nb-hov {
+  transition:
+    background 0.12s ease,
+    color 0.12s ease,
+    border-color 0.12s;
+}
+.nb-hov:hover {
+  background: var(--hover);
+}
+.nb-press {
+  transition: transform 0.08s ease;
+}
+.nb-press:active {
+  transform: scale(0.97);
+}
+.nb-focusable:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.nb-fadein {
+  animation: nbFade 0.22s ease both;
+}
+@keyframes nbFade {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.nb-rise {
+  animation: nbRise 0.26s cubic-bezier(0.2, 0.7, 0.3, 1) both;
+}
+@keyframes nbRise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.nb-sheet-in {
+  animation: nbSheet 0.3s cubic-bezier(0.2, 0.8, 0.25, 1) both;
+}
+@keyframes nbSheet {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: none;
+  }
+}
+.nb-cursor {
+  display: inline-block;
+  width: 7px;
+  height: 15px;
+  background: var(--accent);
+  vertical-align: -2px;
+  margin-left: 1px;
+  animation: nbBlink 1s steps(1) infinite;
+  border-radius: 1px;
+}
+@keyframes nbBlink {
+  50% {
+    opacity: 0;
+  }
+}
+.nb-spin {
+  animation: nbSpin 0.9s linear infinite;
+}
+@keyframes nbSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.nb-drawer-in {
+  animation: nbDrawer 0.26s cubic-bezier(0.2, 0.8, 0.25, 1) both;
+}
+@keyframes nbDrawer {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: none;
+  }
+}
+.nb-sheet-up {
+  animation: nbSheetUp 0.3s cubic-bezier(0.2, 0.8, 0.25, 1) both;
+}
+@keyframes nbSheetUp {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .nb-fadein,
+  .nb-rise,
+  .nb-sheet-in,
+  .nb-drawer-in,
+  .nb-sheet-up {
+    animation: none;
+  }
+  .nb-cursor,
+  .nb-spin {
+    animation: none;
+  }
+}

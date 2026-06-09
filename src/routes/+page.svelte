@@ -1,10 +1,11 @@
 <script lang="ts">
-  // Nebula workspace — the note-taking surfaces on the REAL retrieval pipeline, now with
+  // Nebula workspace — the "Obsidian DNA" surfaces on the REAL RAG pipeline, now with
   // multi-format ingestion: drop PDF/CSV/TXT/MD → intake → Markdown Proxy Note (source
   // backlink, original untouched) → chunk → bge embed → SurrealDB HNSW (indxdb) → retrieve
   // → WebLLM grounded answer. 40/60 resizable split (FR-UI-001); Magic Jump scroll+highlight
   // (FR-CHAT-003); the Weaver auto-wikilinks (FR-LINK-001/002); Micro-Map (FR-GRAPH-001/002);
   // Export Vault → .zip of .md proxies + original binaries under sources/ (FR-DATA-006). In-browser.
+  import '$lib/styles/tokens.css';
   import { onMount, tick } from 'svelte';
   import type { SearchHit } from '$lib/inference/provider';
   import type { NoteRecord, ExpandedHit } from '$lib/db/store';
@@ -235,9 +236,8 @@
   // Retrieval scope (FR-RET-004) — restrict Ask + Compile to one client (folder/tag).
   let scope = $state<Scope | null>(null);
 
-  // Answer mode (FR-CHAT-005): 'reason' = the default — feeds the model the FULL relevant note(s) as
-  // context and lets it reason over the whole thing (so it can answer about ANY part of a note, plus
-  // apply general knowledge); 'grounded' = strict, chunk-precise, notes-only, every claim cited.
+  // Answer mode (FR-CHAT-005): 'reason' = apply knowledge + reason WITH the notes (default — what
+  // makes it feel like an assistant, not a search box); 'grounded' = strict, notes-only, verifiable.
   let answerMode = $state<'grounded' | 'reason'>('reason');
 
   // Knowledge graph (Phases 1–4). GraphRAG fuses vector seeds with graph-connected siblings — the
@@ -268,6 +268,17 @@
   // always present — opening a note fills the doc panel beside it, never replaces the tree, the
   // Obsidian explorer model); 'graph' = the Entities section: an entity list + a node-link graph.
   let rightView = $state<'files' | 'graph'>('files');
+
+  // "Clean Slate" design system: light/dark theme on the document root (data-theme).
+  // Initialized from ui-prefs in onMount (client-only, avoids a hydration mismatch).
+  let theme = $state<'light' | 'dark'>('light');
+  function toggleTheme() {
+    theme = theme === 'dark' ? 'light' : 'dark';
+    uiPrefs.setTheme(theme);
+  }
+  $effect(() => {
+    if (typeof document !== 'undefined') document.documentElement.dataset.theme = theme;
+  });
   let entityQuery = $state(''); // filter box for the Graph-mode entity list
 
   // Empty folders the user created (folders are otherwise derived from note paths) — persisted in
@@ -310,10 +321,6 @@
   let pasteBack = $state(''); // CE4 — paste a frontier answer to resolve its citations back to the vault
   let exportAudit = $state<AuditRecord[]>([]); // CE3 — local export log (hashes + counts only, NFR-SEC-004)
 
-  // 40/60 resizable split (FR-UI-001).
-  let leftPct = $state(40);
-  let splitEl: HTMLDivElement;
-  let dragging = $state(false);
   let preview = $state<{ text: string; x: number; y: number } | null>(null);
 
   let pipe: {
@@ -377,6 +384,7 @@
 
   onMount(async () => {
     coi = crossOriginIsolated;
+    theme = uiPrefs.getTheme();
     // Probe WebGPU once at startup (FR-CAP-001, ADR-030): is chat possible and on what GPU? Drives the
     // GPU status line + the model recommendation. (We deliberately do NOT read maxBufferSize as a load
     // cap — WebLLM shards weights across buffers, so large models load fine on capable GPUs.)
@@ -1611,12 +1619,14 @@
     activeDoc = target.docId;
     activeSpan = { charStart: target.charStart, charEnd: target.charEnd };
     rightView = 'files'; // Magic Jump lands on the cited note in the doc panel
+    mode = 'ask'; // unified center: leave the editor so the cited note renders (read)
   }
 
   function showSource(docId: string) {
     activeDoc = docId;
     activeSpan = null;
     rightView = 'files'; // ensure the note is visible (beside the tree), not hidden behind Graph view
+    mode = 'ask'; // unified center: leave the editor so the opened note renders (read), not the draft
     closeCtxMenu();
   }
 
@@ -1647,24 +1657,6 @@
     };
   }
   const hidePreview = () => (preview = null);
-
-  // Resizable divider.
-  function startDrag(e: PointerEvent) {
-    dragging = true;
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-  }
-  function onDrag(e: PointerEvent) {
-    if (!dragging || !splitEl) return;
-    const rect = splitEl.getBoundingClientRect();
-    leftPct = Math.min(70, Math.max(25, ((e.clientX - rect.left) / rect.width) * 100));
-  }
-  function endDrag() {
-    dragging = false;
-  }
-  function dividerKey(e: KeyboardEvent) {
-    if (e.key === 'ArrowLeft') leftPct = Math.max(25, leftPct - 2);
-    if (e.key === 'ArrowRight') leftPct = Math.min(70, leftPct + 2);
-  }
 
   const activeNote = $derived(activeDoc ? vault.find((n) => n.docId === activeDoc) : undefined);
   const activeBacklinks = $derived(activeDoc ? (backlinks.get(activeDoc) ?? []) : []);
@@ -1938,71 +1930,288 @@
 
 <svelte:window onkeydown={onGlobalKey} />
 
-<main class="shell">
-  <header class="topbar">
-    <span class="brand">✦ Nebula</span>
-    <span class="tag">notes that think · nothing leaves your device</span>
-    <button class="eject" onclick={openSwitcher} title="Quick switch to a note (Ctrl/⌘+K)">
-      ⌘K Switch
-    </button>
-    <button
-      class="eject"
-      onclick={exportVault}
-      title="Export the vault as a portable .zip — .md proxies + original binaries (FR-DATA-006)"
-    >
-      ⤓ Export Vault
-    </button>
-    <button
-      class="eject"
-      onclick={reopenModelGate}
-      title="Choose / switch the local AI model to warm up"
-    >
-      🧠 {modelById(modelId)?.label ?? 'Model'}
-    </button>
-    {#if bgPending > 0}
-      <span class="bg-index" title="Notes are saved instantly; embedding runs in the background.">
-        <span class="spinner" aria-hidden="true"></span>
-        indexing{bgProgress ? ` ${bgProgress}` : ''}{bgPending > 1 ? ` · ${bgPending} queued` : ''}
-      </span>
+{#snippet ic(name: string, sz = 16)}
+  <svg
+    width={sz}
+    height={sz}
+    viewBox="0 0 16 16"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="1.6"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    aria-hidden="true"
+  >
+    {#if name === 'search'}<circle cx="7" cy="7" r="5" /><line x1="11" y1="11" x2="15" y2="15" />
+    {:else if name === 'chevdown'}<polyline points="4,6 8,10 12,6" />
+    {:else if name === 'chevron'}<polyline points="6,4 10,8 6,12" />
+    {:else if name === 'file'}<path d="M4 2.5h5l3 3v8H4z" /><path d="M9 2.5v3h3" />
+    {:else if name === 'folder'}<path d="M2.5 4.5h3.5l1.2 1.5h6.3v7H2.5z" />
+    {:else if name === 'link'}<path
+        d="M6.5 9.5a2.5 2.5 0 0 0 3.5 0l2-2a2.5 2.5 0 0 0-3.5-3.5l-1 1"
+      /><path d="M9.5 6.5a2.5 2.5 0 0 0-3.5 0l-2 2a2.5 2.5 0 0 0 3.5 3.5l1-1" />
+    {:else if name === 'dots'}<g fill="currentColor" stroke="none"
+        ><circle cx="4" cy="8" r="1.3" /><circle cx="8" cy="8" r="1.3" /><circle
+          cx="12"
+          cy="8"
+          r="1.3"
+        /></g
+      >
+    {:else if name === 'download'}<path d="M8 3v7" /><polyline points="5,7.5 8,10.5 11,7.5" /><path
+        d="M3.5 12.5h9"
+      />
+    {:else if name === 'arrow'}<line x1="3.5" y1="8" x2="12" y2="8" /><polyline
+        points="8.5,4.5 12,8 8.5,11.5"
+      />
+    {:else if name === 'edit'}<path d="M3 13l1-3 6.5-6.5a1.5 1.5 0 0 1 2 2L6 12l-3 1z" />
+    {:else if name === 'check'}<polyline points="3,8.5 6.5,12 13,4.5" />
+    {:else if name === 'box'}<path d="M8 2l5 2.8v6.4L8 14l-5-2.8V4.8z" /><path
+        d="M3 4.8L8 7.6l5-2.8"
+      /><line x1="8" y1="7.6" x2="8" y2="14" />
+    {:else if name === 'graph'}<circle cx="8" cy="4" r="1.8" /><circle
+        cx="4"
+        cy="12"
+        r="1.8"
+      /><circle cx="12" cy="12" r="1.8" /><line x1="8" y1="5.8" x2="4.6" y2="10.4" /><line
+        x1="8"
+        y1="5.8"
+        x2="11.4"
+        y2="10.4"
+      />
+    {:else if name === 'sun'}<circle cx="8" cy="8" r="3" /><path
+        d="M8 1.5v1.5M8 13v1.5M2.4 2.4l1 1M12.6 12.6l1 1M1.5 8H3M13 8h1.5M2.4 13.6l1-1M12.6 3.4l1-1"
+      />
+    {:else if name === 'moon'}<path d="M13 9.5A5.5 5.5 0 1 1 6.5 3a4.5 4.5 0 0 0 6.5 6.5z" />
+    {:else if name === 'close'}<line x1="4" y1="4" x2="12" y2="12" /><line
+        x1="12"
+        y1="4"
+        x2="4"
+        y2="12"
+      />
+    {:else if name === 'copy'}<rect x="5" y="5" width="8" height="8" rx="1.6" /><path
+        d="M3 11V4a1 1 0 0 1 1-1h7"
+      />
+    {:else if name === 'eyeoff'}<path
+        d="M2 8s2.5-4 6-4 6 4 6 4-2.5 4-6 4a6.7 6.7 0 0 1-2.2-.4"
+      /><line x1="3" y1="3" x2="13" y2="13" />
+    {:else if name === 'plus'}<line x1="8" y1="3.5" x2="8" y2="12.5" /><line
+        x1="3.5"
+        y1="8"
+        x2="12.5"
+        y2="8"
+      />
+    {:else if name === 'send'}<path d="M3 8h8" /><polyline points="7.5,4.5 11,8 7.5,11.5" />
+    {:else if name === 'bolt'}<path d="M9 2L4 9h3l-1 5 5-7H8z" />
+    {:else if name === 'menu'}<line x1="2.5" y1="4.5" x2="13.5" y2="4.5" /><line
+        x1="2.5"
+        y1="8"
+        x2="13.5"
+        y2="8"
+      /><line x1="2.5" y1="11.5" x2="13.5" y2="11.5" />
     {/if}
-    <span class="status">
-      {#if busy || !ready}<span class="spinner" aria-hidden="true"></span>{/if}
-      {status}{ready && ttft ? ` · TTFT ${ttft}ms · ${tps} tok/s` : ''}
-    </span>
-    <span class="coi" class:ok={coi}>{coi ? 'isolated ✓' : 'not isolated'}</span>
+  </svg>
+{/snippet}
+
+{#snippet tree(nodes: TreeNode[])}
+  {#each nodes as node (node.path)}
+    {#if node.kind === 'folder'}
+      <button
+        class="tree-folder nb-hov"
+        class:drop={dropFolder === node.path}
+        onclick={() => toggleFolder(node.path)}
+        oncontextmenu={(e) => openCtxMenu(e, 'folder', node.path)}
+        ondragover={(e) => onTreeDragOverFolder(e, node.path)}
+        ondragleave={() => {
+          if (dropFolder === node.path) dropFolder = null;
+        }}
+        ondrop={(e) => onTreeDropFolder(e, node.path)}
+      >
+        <span class="caret" class:open={!collapsed.has(node.path)}>{@render ic('chevron', 13)}</span
+        >
+        {node.name}<span class="tree-count"
+          >{node.children.filter((c) => c.kind !== 'folder').length}</span
+        >
+      </button>
+      {#if !collapsed.has(node.path)}
+        <div class="tree-children">{@render tree(node.children)}</div>
+      {/if}
+    {:else}
+      {@const on = activeDoc === node.docId && rightView === 'files'}
+      <button
+        class="tree-file nb-hov"
+        class:active={on}
+        class:dragging={dragDocId === node.docId}
+        draggable="true"
+        onclick={() => node.docId && showSource(node.docId)}
+        oncontextmenu={(e) => openCtxMenu(e, 'file', node.docId ?? '')}
+        ondragstart={(e) => node.docId && onTreeDragStart(e, node.docId)}
+        ondragend={onTreeDragEnd}
+      >
+        <span class="tf-ic">{@render ic('file', 13)}</span>
+        <span class="tf-nm">{node.name}</span>
+      </button>
+    {/if}
+  {/each}
+{/snippet}
+
+<main
+  class="nb-app shell"
+  class:drop={dropActive}
+  ondragover={(e) => {
+    e.preventDefault();
+    dropActive = true;
+  }}
+  ondragleave={() => (dropActive = false)}
+  ondrop={onDrop}
+>
+  <!-- ───────── TOPBAR ───────── -->
+  <header class="topbar">
+    <div class="tb-left">
+      <svg class="brand-mark" width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
+        <circle cx="9" cy="9" r="7" fill="none" stroke="var(--accent)" stroke-width="2" />
+        <circle cx="9" cy="9" r="2.6" fill="var(--accent)" />
+      </svg>
+      <span class="brand-name">Nebula</span>
+    </div>
+    <div class="tb-center">
+      <button class="omnibox nb-hov nb-focusable" onclick={openSwitcher} title="Search or ask (⌘K)">
+        <span class="omni-ic">{@render ic('search', 15)}</span>
+        <span class="omni-txt">Search or ask your vault…</span>
+        <kbd>⌘K</kbd>
+      </button>
+    </div>
+    <div class="tb-right">
+      <button
+        class="pill model-pill nb-hov nb-press"
+        onclick={reopenModelGate}
+        title="On-device chat model"
+      >
+        <span class="dot ok"></span>{modelById(modelId)?.label ?? 'Model'}{@render ic(
+          'chevdown',
+          12
+        )}
+      </button>
+      {#if bgPending > 0}
+        <span class="pill busy-pill"
+          ><span class="spinner"></span>indexing{bgProgress ? ` ${bgProgress}` : ''}</span
+        >
+      {:else if ready}
+        <span class="pill ok-pill">{@render ic('check', 13)} indexed</span>
+      {/if}
+      <button class="icon-btn nb-hov nb-press" onclick={exportVault} title="Export vault"
+        >{@render ic('download', 16)}</button
+      >
+      <button class="icon-btn nb-hov nb-press" onclick={toggleTheme} title="Toggle theme"
+        >{@render ic(theme === 'dark' ? 'sun' : 'moon', 16)}</button
+      >
+    </div>
   </header>
 
-  <div class="split" bind:this={splitEl}>
-    <!-- LEFT (40%) — the Active/Command zone: chat + Micro-Map -->
-    <section class="pane chat" style="width: {leftPct}%" aria-label="Chat">
-      <div class="modes" role="tablist" aria-label="Left pane mode">
-        <button
-          class="modetab primary"
-          class:active={mode === 'write'}
-          role="tab"
-          aria-selected={mode === 'write'}
-          onclick={startNewNote}>✎ New note</button
-        >
-        <button
-          class="modetab"
-          class:active={mode === 'ask'}
-          role="tab"
-          aria-selected={mode === 'ask'}
-          onclick={() => (mode = 'ask')}>Ask</button
-        >
+  <!-- ───────── MODEL BANNER (non-blocking) ───────── -->
+  {#if loadPhase}
+    <div class="model-banner">
+      <span class="spinner"></span>
+      <span
+        >Setting up on-device chat model · <strong>{modelById(modelId)?.label ?? 'model'}</strong
+        ></span
+      >
+      <span class="mb-bar"><span class="mb-fill" style="width:{loadPct}%"></span></span>
+      <span class="mb-pct">{loadPct}%</span>
+      <span class="mb-div"></span>
+      <span class="mb-note">Semantic search works now — no GPU needed</span>
+    </div>
+  {/if}
+
+  <!-- ───────── BODY: sidebar · center · ask rail ───────── -->
+  <div class="body">
+    <!-- SIDEBAR -->
+    <aside
+      class="sidebar"
+      class:drop={dropFolder === ''}
+      ondragover={(e) => onTreeDragOverFolder(e, '')}
+      ondragleave={() => {
+        if (dropFolder === '') dropFolder = null;
+      }}
+      ondrop={(e) => onTreeDropFolder(e, '')}
+    >
+      <div class="side-scroll">
+        <div class="side-head">
+          <span class="label">Vault · {vault.length}</span>
+          <button
+            class="ghost-ic nb-hov nb-press"
+            title="New note / folder"
+            onclick={(e) => openCtxMenu(e, 'root', '')}>{@render ic('plus', 14)}</button
+          >
+        </div>
+
+        {#if activeTag}
+          <div class="side-head">
+            <span class="label">#{activeTag} · {filteredNotes.length}</span><button
+              class="link-btn"
+              onclick={() => (activeTag = null)}>clear</button
+            >
+          </div>
+          {#each filteredNotes as note (note.docId)}
+            <button
+              class="tree-file nb-hov"
+              class:active={activeDoc === note.docId}
+              onclick={() => showSource(note.docId)}
+              oncontextmenu={(e) => openCtxMenu(e, 'file', note.docId)}
+            >
+              <span class="tf-ic">{@render ic('file', 13)}</span><span class="tf-nm"
+                >{note.title}</span
+              >
+            </button>
+          {/each}
+        {:else}
+          {@render tree(fileTree)}
+        {/if}
+
+        <div class="side-head mt">
+          <span class="label">Entities</span><span class="tree-count">{entityIndex.length}</span>
+        </div>
+        {#if entityIndex.length}
+          {#each entityIndex.slice(0, 6) as e (e.id)}
+            {@const on = rightView === 'graph' && selectedEntity?.id === e.id}
+            <button
+              class="ent-row nb-hov"
+              class:active={on}
+              onclick={() => openEntity(e)}
+              title={e.type}
+            >
+              <span class="ent-dot" style="background:{entityColor(e.type)}"></span>
+              <span class="ent-nm">{e.name}</span>
+              <span class="tree-count">{e.noteCount}</span>
+            </button>
+          {/each}
+          <button class="ent-row open-lens nb-hov" onclick={() => switchView('graph')}>
+            <span class="lens-ic">{@render ic('graph', 14)}</span> Open graph lens
+          </button>
+        {:else}
+          <button class="build-graph nb-press" onclick={buildVaultGraph} disabled={graphBusy}>
+            {#if graphBusy}<span class="spinner"></span>extracting…{:else}{@render ic('graph', 14)} Build
+              entity graph{/if}
+          </button>
+        {/if}
+
+        {#if tagIndex.length}
+          <div class="side-head mt"><span class="label">Tags</span></div>
+          <div class="tagwrap">
+            {#each tagIndex as t (t.tag)}
+              <button
+                class="tagchip nb-hov"
+                class:active={activeTag === t.tag}
+                onclick={() => toggleTag(t.tag)}>#{t.tag}</button
+              >
+            {/each}
+          </div>
+        {/if}
       </div>
 
-      {#if mode === 'ask'}
-        <div class="controls">
-          <select
-            bind:value={modelId}
-            disabled={busy || !!loadPhase}
-            title={loadPhase ? 'Locked while a model is loading…' : 'Choose the chat model'}
-          >
-            {#each MODELS as m (m.id)}<option value={m.id}
-                >{m.label} · {formatSize(m.sizeMB)}</option
-              >{/each}
-          </select>
+      <div class="side-foot">
+        <div class="scope-pill">
+          <span class="scope-ic">{@render ic('box', 15)}</span>
+          <span class="scope-lbl">Scope</span>
           <select
             class="scope-select"
             value={scope
@@ -2010,627 +2219,69 @@
                 ? `folder:${scope.value}`
                 : `tag:${scope.value}`
               : ''}
-            disabled={busy}
-            title="Restrict Ask + Compile to one client (folder or tag) — no cross-client bleed"
             onchange={(e) => setScope(e.currentTarget.value)}
+            title="Limit Ask + Compile to one client (no cross-client bleed)"
           >
-            <option value="">🎯 Whole vault</option>
+            <option value="">whole vault</option>
             {#if folderScopes.length}
-              <optgroup label="Folders">
-                {#each folderScopes as f (f)}<option value={`folder:${f}`}>📁 {f}</option>{/each}
-              </optgroup>
+              <optgroup label="Folders"
+                >{#each folderScopes as f (f)}<option value={`folder:${f}`}>{f}/</option
+                  >{/each}</optgroup
+              >
             {/if}
             {#if tagIndex.length}
-              <optgroup label="Tags">
-                {#each tagIndex as t (t.tag)}<option value={`tag:${t.tag}`}>#{t.tag}</option>{/each}
-              </optgroup>
+              <optgroup label="Tags"
+                >{#each tagIndex as t (t.tag)}<option value={`tag:${t.tag}`}>#{t.tag}</option
+                  >{/each}</optgroup
+              >
             {/if}
           </select>
-          <div class="mode-toggle" role="group" aria-label="Answer mode">
-            <button
-              class="mode-btn"
-              class:on={answerMode === 'reason'}
-              disabled={busy}
-              title="Reason WITH your notes — synthesize, infer, and apply knowledge to actually answer"
-              onclick={() => (answerMode = 'reason')}>💡 Reason</button
-            >
-            <button
-              class="mode-btn"
-              class:on={answerMode === 'grounded'}
-              disabled={busy}
-              title="Strict: answer only from the notes, cite everything — verifiable, no outside knowledge"
-              onclick={() => (answerMode = 'grounded')}>📌 Grounded</button
-            >
-          </div>
-          <div class="mode-toggle" role="group" aria-label="Retrieval mode">
-            <button
-              class="mode-btn"
-              class:on={graphRagOn}
-              disabled={busy}
-              title="GraphRAG: also pull in chunks connected through SHARED ENTITIES, not just semantically similar ones — the context plain vector search misses. Falls back to plain RAG when the vault has no graph."
-              onclick={() => (graphRagOn = !graphRagOn)}
-              >🕸 GraphRAG {graphRagOn ? 'on' : 'off'}</button
-            >
-          </div>
+          {@render ic('chevdown', 13)}
         </div>
-
-        {#if ready}
-          {@const rec = recommendModel(!!gpu?.ok)}
-          <div class="gpu-bar" class:warn={!gpu?.ok}>
-            {#if gpu?.ok}
-              <span title="On-device GPU detected — local chat runs here"
-                >🖥 GPU: {gpu.vendor || 'WebGPU'}{gpu.arch ? ` (${gpu.arch})` : ''}</span
-              >
-              {#if loadPhase}
-                <span class="loading-model">
-                  <span class="spinner" aria-hidden="true"></span>
-                  {loadPhase}
-                  {modelById(modelId)?.label ?? 'model'} · {loadPct}%
-                  {#if loadPhase === 'downloading'}<small
-                      >one-time {formatSize(modelById(modelId)?.sizeMB ?? 0)}</small
-                    >{:else if loadPhase === 'compiling'}<small>GPU compiling, a few seconds…</small
-                    >{/if}
-                </span>
-                <span class="progress" aria-hidden="true"
-                  ><span class="progress-fill" style="width:{loadPct}%"></span></span
-                >
-              {:else if loadedModel === modelId}
-                <span class="ok">✓ {modelById(modelId)?.label ?? 'model'} loaded</span>
-                {#if rec && rec.id !== modelId}
-                  <button class="mini accent" onclick={useRecommended} disabled={busy}
-                    >★ Use {rec.label}</button
-                  >
-                {/if}
-              {:else}
-                <button class="mini accent" onclick={warmStartup} disabled={busy}
-                  >⬇ Load {modelById(modelId)?.label ?? 'model'} ({formatSize(
-                    modelById(modelId)?.sizeMB ?? 0
-                  )})</button
-                >
-                {#if rec && rec.id !== modelId}
-                  <button
-                    class="mini"
-                    onclick={useRecommended}
-                    disabled={busy}
-                    title="Best quality that loads reliably on this GPU (multilingual)"
-                    >★ {rec.label} instead</button
-                  >
-                {/if}
-              {/if}
-            {:else}
-              ⚠ No WebGPU — chat unavailable (semantic search still works). Use Chrome/Edge on a
-              GPU-capable device.
-            {/if}
-          </div>
-        {/if}
-
-        <textarea bind:value={query} rows="2" placeholder="Ask a question…" disabled={busy}
-        ></textarea>
-        <div class="ask-row">
-          <button class="ask" onclick={ask} disabled={!ready || busy}
-            >{busy ? 'Working…' : 'Ask'}</button
-          >
-          <button
-            class="ghost"
-            onclick={openCompileFromScope}
-            disabled={!ready}
-            title="Compile {scope
-              ? scopeLabel(scope)
-              : 'the whole vault'} into a compact, token-counted payload for another LLM (GPT/Claude)"
-            >📦 Compile {scope ? 'scope' : 'vault'}</button
-          >
-        </div>
-
-        {#if busy || !ready}
-          <div class="loading-banner">
-            <span class="spinner"></span>
-            <span>
-              {status}
-              {#if /model/i.test(status)}<br /><small
-                  >{modelCached
-                    ? 'Loading the cached model from disk — no download.'
-                    : "First run downloads the model once (~hundreds of MB), then it's cached — later runs are fast."}</small
-                >{/if}
-            </span>
-          </div>
-        {/if}
-
-        {#if hits.length}
-          {@const usage = answerUsage(
-            hits.map((h) => h.chunkId),
-            cites.map((c) => c.chunkId)
-          )}
-          <div class="sources">
-            <div class="block-h">
-              Retrieved sources{#if graphInfo}
-                <span
-                  class="graph-badge"
-                  title="GraphRAG added chunks reached through shared entities">🕸 {graphInfo}</span
-                >{/if}{#if usage.count > 0}
-                <span
-                  class="used-badge"
-                  title="How many retrieved notes the model actually cited in its answer — the LLM's own provenance, not the embedding/graph candidate set"
-                  >✓ answer used {usage.count}/{hits.length}</span
-                >{/if}
-            </div>
-            {#each hits as h, i (h.chunkId)}
-              {@const used = usage.used.has(h.chunkId)}
-              <button class="src" class:used onclick={() => jumpTo(h.chunkId)}>
-                <span class="src-n">[#{i + 1}]</span>
-                {h.docId}{#if used}<span
-                    class="used-tag"
-                    title="Cited by the answer — the model actually used this">✓ used</span
-                  >{/if}
-                {#if graphExpandedIds.has(h.chunkId)}<span
-                    class="graph-badge"
-                    title="Reached through the entity graph (not vector similarity) — shared: {(
-                      graphShared.get(h.chunkId)?.sharedEntities ?? []
-                    ).join(', ')}"
-                    >🕸 {(graphShared.get(h.chunkId)?.sharedEntities ?? []).join(', ')}</span
-                  >{:else}<span class="score">{h.score.toFixed(2)}</span>{/if}
-              </button>
-            {/each}
-          </div>
-        {/if}
-
-        {#if graph}
-          <div class="micromap">
-            <div class="block-h">Micro-Map · how the AI answered</div>
-            <svg
-              width="100%"
-              height={40 + graph.nodes.filter((n) => n.kind === 'chunk').length * 30}
-              class="graph"
-            >
-              {#each graph.edges as e, i (e.to)}
-                {@const cy = 30 + i * 30}
-                <line
-                  x1="78"
-                  y1="24"
-                  x2="76%"
-                  y2={cy}
-                  stroke="#6750a4"
-                  stroke-width={e.width}
-                  stroke-opacity="0.55"
-                  stroke-dasharray={e.viaGraph ? '4 3' : undefined}
-                />
-              {/each}
-              <circle cx="40" cy="24" r="9" fill="#6750a4" />
-              <text x="40" y="44" text-anchor="middle" class="g-label">query</text>
-              {#each graph.nodes.filter((n) => n.kind === 'chunk') as n, i (n.id)}
-                {@const cy = 30 + i * 30}
-                <circle
-                  cx="76%"
-                  {cy}
-                  r="6"
-                  fill={n.viaGraph ? '#6750a4' : '#efeaf8'}
-                  stroke="#6750a4"
-                />
-                <text x="80%" y={cy + 4} class="g-label"
-                  >{n.label}{#if n.viaGraph}
-                    · 🕸 {(n.sharedEntities ?? []).join(', ')}{:else}
-                    · {n.score}{/if}</text
-                >
-              {/each}
-            </svg>
-          </div>
-        {/if}
-
-        {#if answer}
-          <div class="answer">
-            <div class="block-h">Answer</div>
-            <!-- Rendered as safe Markdown (FR-CHAT-001, ADR-016): headings/lists/bold/tables format
-                 properly instead of raw text; [#n] citations are clickable Magic Jumps. -->
-            <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-            <article
-              class="answer-body md"
-              onclick={onRenderedClick}
-              onkeydown={(e) => e.key === 'Enter' && onRenderedClick(e as unknown as MouseEvent)}
-              role="document"
-            >
-              {@html answerHtml}
-            </article>
-            {#if references.length}
-              <div class="references">
-                <div class="block-h">
-                  References — {references.length} note{references.length > 1 ? 's' : ''}
-                </div>
-                {#each references as r (r.docId)}
-                  {@const cited = cites.some((c) => c.docId === r.docId)}
-                  <button
-                    class="reference"
-                    class:cited
-                    onclick={() => jumpTo(r.chunkId)}
-                    onmouseenter={(e) => showPreview(e, r.docId)}
-                    onmouseleave={hidePreview}
-                    title="Open this note"
-                  >
-                    <span class="ref-n">[{r.n}]</span>
-                    <span class="ref-title"
-                      >{vault.find((n) => n.docId === r.docId)?.title ?? r.docId}</span
-                    >
-                    <span class="ref-doc">{r.docId}</span>
-                  </button>
-                {/each}
-              </div>
-            {/if}
-            {#if hits.length}
-              <button
-                class="ghost compile-ctx"
-                onclick={openCompileFromHits}
-                title="Compile just the retrieved context (the relevant ~5%) for another LLM"
-                >📦 Compile this context →</button
-              >
-            {/if}
-          </div>
-        {/if}
-      {:else}
-        <div class="editor">
-          <div class="editor-top">
-            <input
-              class="title-input"
-              bind:value={draftTitle}
-              placeholder="Note title"
-              disabled={savingNote}
-            />
-            {#if !editingDocId}
-              <input
-                class="folder-input"
-                bind:value={draftFolder}
-                placeholder="folder"
-                title="Folder (e.g. clients/acme) — created on save"
-                disabled={savingNote}
-              />
-            {/if}
-            <select
-              class="tpl-select"
-              disabled={savingNote}
-              title="Insert a template"
-              onchange={(e) => {
-                const el = e.currentTarget;
-                applyTemplate(el.value);
-                el.selectedIndex = 0;
-              }}
-            >
-              <option value="">Template ▾</option>
-              {#each BUILTIN_TEMPLATES as t (t.id)}
-                <option value={t.id}>{t.label}</option>
-              {/each}
-            </select>
-          </div>
-          <div class="body-wrap">
-            <textarea
-              class="body-input"
-              bind:this={bodyEl}
-              bind:value={draftBody}
-              rows="14"
-              placeholder="Write your note in Markdown… type [[ to link a note"
-              disabled={savingNote}
-              oninput={onBodyInput}
-              onkeyup={onBodyInput}
-              onclick={onBodyInput}
-            ></textarea>
-            {#if wlState && wlState.suggestions.length}
-              <ul class="wl-menu">
-                {#each wlState.suggestions as s (s.docId)}
-                  <li>
-                    <button
-                      class="wl-item"
-                      onmousedown={(e) => e.preventDefault()}
-                      onclick={() => pickWikilink(s.title)}
-                    >
-                      <span class="wl-title">{s.title}</span>
-                      <span class="wl-doc">{s.docId}</span>
-                    </button>
-                  </li>
-                {/each}
-              </ul>
-            {/if}
-          </div>
-          {#if previewOn && draftBody.trim()}
-            <div class="block-h">Preview</div>
-            <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-            <article
-              class="doc rendered editor-preview"
-              onclick={onRenderedClick}
-              onkeydown={(e) => e.key === 'Enter' && onRenderedClick(e as unknown as MouseEvent)}
-              role="document"
-            >
-              {@html renderMarkdown(draftBody, { resolveLink: resolveNoteLink })}
-            </article>
-          {/if}
-          <div class="editor-actions">
-            <button class="ask" onclick={saveNote} disabled={!ready || savingNote}>
-              {savingNote ? 'Saving…' : editingDocId ? 'Save changes' : 'Save note'}
-            </button>
-            <button class="ghost" onclick={startNewNote} disabled={savingNote}>＋ New</button>
-            <button
-              class="ghost"
-              onclick={() => (previewOn = !previewOn)}
-              title="Toggle live Markdown preview">👁 {previewOn ? 'Hide' : 'Preview'}</button
-            >
-            {#if editMsg}<span class="editmsg">{editMsg}</span>{/if}
-          </div>
-          <p class="editor-hint">
-            Saved as a portable <code>.md</code> in <code>notes/</code> — instantly searchable, citable,
-            and exportable to any LLM via Export Vault / the Context Compiler.
-          </p>
-        </div>
-      {/if}
-    </section>
-
-    <!-- Window-splitter: an intentionally interactive separator (pointer drag + arrow keys). -->
-    <button
-      class="divider"
-      class:dragging
-      onpointerdown={startDrag}
-      onpointermove={onDrag}
-      onpointerup={endDrag}
-      onkeydown={dividerKey}
-      aria-label="Resize panes (arrow keys)"
-    ></button>
-
-    <!-- RIGHT (60%) — the Reference zone: document viewer / vault / drop target -->
-    <section
-      class="pane viewer"
-      class:drop={dropActive}
-      aria-label="Document viewer and ingestion drop zone"
-      ondragover={(e) => {
-        e.preventDefault();
-        dropActive = true;
-      }}
-      ondragleave={() => (dropActive = false)}
-      ondrop={onDrop}
-    >
-      <div class="toolbar">
-        <div class="viewswitch" role="tablist" aria-label="Workspace view">
-          <button
-            class="vbtn"
-            class:on={rightView === 'files'}
-            role="tab"
-            aria-selected={rightView === 'files'}
-            onclick={() => switchView('files')}>📁 Files</button
-          >
-          <button
-            class="vbtn"
-            class:on={rightView === 'graph'}
-            role="tab"
-            aria-selected={rightView === 'graph'}
-            title="Entities + how they connect, as a graph"
-            onclick={() => switchView('graph')}>🕸 Graph</button
-          >
-        </div>
-        <button class="addfiles newnote" onclick={startNewNote} disabled={!ready}>
-          ✎ New note
-        </button>
-        <button class="addfiles newnote" onclick={openDailyNote} disabled={!ready}>
-          📅 Today
-        </button>
-        <button class="addfiles" onclick={() => fileInput?.click()} disabled={!ready}>
-          ＋ Add files
-        </button>
-        {#if importMsg}<span class="importmsg">{importMsg}</span>{/if}
       </div>
-      <input
-        class="hidden-input"
-        type="file"
-        multiple
-        accept=".pdf,.csv,.txt,.md,.markdown,.text"
-        bind:this={fileInput}
-        onchange={(e) => ingestFiles((e.currentTarget as HTMLInputElement).files)}
-      />
+    </aside>
 
-      <div class="workspace">
-        {#if rightView === 'files'}
-          <!-- Folder sidebar — ALWAYS present; opening a note fills the doc panel BESIDE it. -->
-          <aside
-            class="tree-aside"
-            class:drop={dropFolder === ''}
-            ondragover={(e) => onTreeDragOverFolder(e, '')}
-            ondragleave={() => {
-              if (dropFolder === '') dropFolder = null;
-            }}
-            ondrop={(e) => onTreeDropFolder(e, '')}
+    <!-- CENTER -->
+    <section class="center">
+      {#if rightView === 'graph'}
+        <!-- GRAPH LENS -->
+        <div class="lens-head">
+          <span class="lens-ic accent">{@render ic('graph', 18)}</span>
+          <span class="lens-title">Graph lens</span>
+          <span class="lens-sub"
+            >{entityIndex.length} entities · {entityRelations.length} relations</span
           >
-            <div class="block-h">
-              📁 Vault — {vault.length}
-              <button
-                class="back"
-                title="New note / new folder"
-                onclick={(e) => openCtxMenu(e, 'root', '')}>＋ New</button
-              >
+          <span class="spacer"></span>
+          {#if entityIndex.length}<span class="pill ok-pill"
+              >{@render ic('check', 13)} graph built</span
+            >{/if}
+          <button
+            class="icon-btn nb-hov nb-press"
+            onclick={() => switchView('files')}
+            title="Close lens">{@render ic('close', 15)}</button
+          >
+        </div>
+        <div class="lens-body">
+          {#if graphBusy}
+            <div class="center-empty">
+              <span class="spinner big"></span>
+              <p>Extracting entities & relations…</p>
             </div>
-            {#if activeTag}
-              <div class="block-h">
-                #{activeTag} — {filteredNotes.length}
-                <button class="back" onclick={() => (activeTag = null)}>✕ clear</button>
-              </div>
-              {#each filteredNotes as note (note.docId)}
-                <button
-                  class="tree-file"
-                  class:active={activeDoc === note.docId}
-                  onclick={() => showSource(note.docId)}
-                  oncontextmenu={(e) => openCtxMenu(e, 'file', note.docId)}
-                >
-                  📄 {shortName(note.docId)}{#if note.kind}<span class="badge">{note.kind}</span
-                    >{/if}
-                </button>
-              {/each}
-            {:else}
-              {@render treeView(fileTree)}
-            {/if}
-            {#if tagIndex.length}
-              <div class="block-h tags-h">🏷 Tags</div>
-              <div class="tagbar">
-                {#each tagIndex as t (t.tag)}
-                  <button
-                    class="tagchip"
-                    class:active={activeTag === t.tag}
-                    onclick={() => toggleTag(t.tag)}
-                    >#{t.tag} <span class="tagcount">{t.count}</span></button
-                  >
-                {/each}
-              </div>
-            {/if}
-          </aside>
-
-          <!-- Doc panel — the open note, beside the tree (it never replaces the tree). -->
-          <div class="docpane">
-            {#if activeNote}
-              <div class="block-h">
-                {activeNote.docId}{activeSpan ? ' · cited span highlighted' : ''}
-                {#if activeNote.kind}<span class="badge">{activeNote.kind}</span>{/if}
-                <span class="note-actions">
-                  {#if !activeNote.sourcePath}
-                    <button class="back edit" onclick={() => editNote(activeNote)}>✎ Edit</button>
-                    <button class="back" onclick={() => renameNoteAction(activeNote)}
-                      >✏️ Rename</button
-                    >
-                  {/if}
-                  <button class="back" onclick={() => moveNoteAction(activeNote)}>📂 Move</button>
-                  <button class="back danger" onclick={() => deleteNote(activeNote.docId)}
-                    >🗑 Delete</button
-                  >
-                  <button class="back" onclick={() => (activeDoc = null)}>✕ close</button>
-                </span>
-              </div>
-              {#if activeNote.sourcePath}
-                <div class="source-link">
-                  📎 source: {activeNote.sourcePath} — original preserved, never edited
-                </div>
-              {/if}
-              {#if activeSpan}
-                {@const seg = buildHighlightSegments(
-                  activeNote.text,
-                  activeSpan.charStart,
-                  activeSpan.charEnd
-                )}
-                <article class="doc">{seg.pre}<mark>{seg.hit}</mark>{seg.post}</article>
-              {:else}
-                <!-- Rendered Markdown preview (FR-UI-002). Output is escape-first/safe (ADR-016);
-                     wikilink clicks/keys are delegated to vault navigation. -->
-                <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-                <article
-                  class="doc rendered"
-                  onclick={onRenderedClick}
-                  onkeydown={(e) =>
-                    e.key === 'Enter' && onRenderedClick(e as unknown as MouseEvent)}
-                  role="document"
-                >
-                  {@html renderMarkdown(activeNote.text, { resolveLink: resolveNoteLink })}
-                </article>
-              {/if}
-
-              {#if activeBacklinks.length || activeUnlinked.length}
-                <div class="links-panel">
-                  {#if activeBacklinks.length}
-                    <div class="block-h">🔗 Backlinks — {activeBacklinks.length}</div>
-                    {#each activeBacklinks as bl (bl.docId)}
-                      <button class="src" onclick={() => showSource(bl.docId)}>
-                        {bl.title}
-                        <span class="score">{bl.count > 1 ? `×${bl.count}` : ''} {bl.docId}</span>
-                      </button>
-                    {/each}
-                  {/if}
-                  {#if activeUnlinked.length}
-                    <div class="block-h">💭 Unlinked mentions — {activeUnlinked.length}</div>
-                    {#each activeUnlinked as um (um.docId)}
-                      <button class="src" onclick={() => showSource(um.docId)}>
-                        <span class="src-n">{um.title}</span>
-                        <span class="um-snippet">{um.snippet}</span>
-                      </button>
-                    {/each}
-                  {/if}
-                </div>
-              {/if}
-            {:else}
-              <div class="empty-doc">
-                <div class="empty-emoji">📄</div>
-                <p>
-                  Select a note from the tree, or
-                  <button class="linklike" onclick={startNewNote}>write a new one</button>.
-                </p>
-                <p class="hint">
-                  Right-click the tree to add · rename · move · delete · new folder. Drag a note
-                  onto a folder to move it.
-                </p>
-              </div>
-            {/if}
-          </div>
-        {:else}
-          <!-- Graph view: the entity list + a node-link graph of the selected entity's neighbourhood. -->
-          <aside class="tree-aside">
-            <div class="block-h">
-              🕸 Entities{#if entityIndex.length}
-                — {entityIndex.length}{/if}
-              <button class="back" onclick={buildVaultGraph} disabled={graphBusy}
-                >{graphBusy
-                  ? 'extracting…'
-                  : entityIndex.length
-                    ? '↻ rebuild'
-                    : '✨ build graph'}</button
-              >
-            </div>
-            {#if entityIndex.length}
-              <input
-                class="entity-search"
-                bind:value={entityQuery}
-                placeholder="Filter entities…"
-                aria-label="Filter entities"
-              />
-              <div class="entity-list">
-                {#each filteredEntities as e (e.id)}
-                  <button
-                    class="entity-item"
-                    class:active={selectedEntity?.id === e.id}
-                    onclick={() => openEntity(e)}
-                    title={e.type}
-                  >
-                    <span class="dot" style="background:{entityColor(e.type)}"></span>
-                    <span class="entity-name">{e.name}</span>
-                    <span class="tagcount">{e.noteCount}</span>
-                  </button>
-                {:else}
-                  <div class="hint">No entity matches “{entityQuery}”.</div>
-                {/each}
-              </div>
-            {:else}
-              <div class="hint">
-                No entity graph yet. Click “build graph” — it loads a chat model, reads your notes,
-                and extracts the people/orgs/concepts + how they connect, so GraphRAG can use them.
-              </div>
-            {/if}
-          </aside>
-
-          <div class="graphpane">
-            {#if graphBusy}
-              <div class="loading-banner">
-                <span class="spinner"></span><span>traversing graph…</span>
-              </div>
-            {:else if selectedEntity && entityLayout}
-              <div class="doc-head">
-                <div class="doc-title">
-                  <span class="dot lg" style="background:{entityColor(selectedEntity.type)}"></span>
-                  {selectedEntity.name}
-                  <span class="badge">{selectedEntity.type}</span>
-                  <span class="score">{selectedEntity.noteCount} notes</span>
-                </div>
-                <button class="back" onclick={closeEntity}>✕ close</button>
-              </div>
-              {#if entityLayout.nodes.length > 1}
-                <div class="graph-hint">drag nodes · drag canvas to pan · scroll to zoom</div>
-                <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+          {:else if selectedEntity && entityLayout}
+            {#if entityLayout.nodes.length > 1}
+              <div class="lens-canvas">
                 <svg
                   bind:this={svgEl}
                   class="entity-graph"
                   class:grabbing={drag !== null}
                   viewBox="0 0 {entityLayout.width} {entityLayout.height}"
-                  role="img"
-                  aria-label="Entity relationship graph for {selectedEntity.name}"
                   onpointerdown={onGraphPointerDown}
                   onpointermove={onGraphPointerMove}
                   onpointerup={onGraphPointerUp}
                   onpointercancel={onGraphPointerUp}
                   onwheel={onGraphWheel}
+                  role="img"
+                  aria-label="Entity graph for {selectedEntity.name}"
                 >
                   <g transform="translate({graphView.tx} {graphView.ty}) scale({graphView.scale})">
                     {#each entityLayout.edges as e (e.from + '|' + e.to + '|' + e.label)}
@@ -2639,11 +2290,24 @@
                         y1={e.y1}
                         x2={e.x2}
                         y2={e.y2}
-                        stroke="#c9c2e6"
+                        stroke="var(--line-strong)"
                         stroke-width="1.5"
                       />
-                      <text x={e.mx} y={e.my} class="edge-label" text-anchor="middle"
-                        >{e.label.replace(/_/g, ' ')}</text
+                      <rect
+                        x={e.mx - e.label.replace(/_/g, ' ').length * 3.3 - 6}
+                        y={e.my - 9}
+                        width={e.label.replace(/_/g, ' ').length * 6.6 + 12}
+                        height="18"
+                        rx="9"
+                        fill="var(--surface)"
+                        stroke="var(--line)"
+                      />
+                      <text
+                        x={e.mx}
+                        y={e.my}
+                        class="edge-label"
+                        text-anchor="middle"
+                        dominant-baseline="middle">{e.label.replace(/_/g, ' ')}</text
                       >
                     {/each}
                     {#each entityLayout.nodes as n (n.id)}
@@ -2661,130 +2325,485 @@
                           cx={n.x}
                           cy={n.y}
                           r={n.r}
-                          fill={entityColor(n.type)}
-                          stroke="#fff"
-                          stroke-width="2"
+                          fill="var(--surface)"
+                          stroke={entityColor(n.type)}
+                          stroke-width={n.hop === 0 ? 2.5 : 1.6}
                         />
-                        <text x={n.x} y={n.y + n.r + 12} class="node-label" text-anchor="middle"
-                          >{n.label}</text
+                        <circle
+                          cx={n.x}
+                          cy={n.y}
+                          r={n.r}
+                          fill={entityColor(n.type)}
+                          opacity={n.hop === 0 ? 0.14 : 0.07}
+                        />
+                        <text
+                          x={n.x}
+                          y={n.y}
+                          class="node-label"
+                          text-anchor="middle"
+                          dominant-baseline="middle">{n.label}</text
                         >
                       </g>
                     {/each}
                   </g>
                 </svg>
-              {:else}
-                <div class="hint">
-                  No relations extracted for {selectedEntity.name} yet — the model found this entity but
-                  not how it connects. Try
-                  <button class="linklike" onclick={buildVaultGraph}>↻ rebuild the graph</button>
-                  with a stronger model (e.g. Qwen2.5-3B) to map connections.
+                <div class="lens-hint">
+                  Click any node to re-center · drag to pan · scroll to zoom
                 </div>
+              </div>
+            {:else}
+              <div class="center-empty">
+                <p>No relations extracted for <strong>{selectedEntity.name}</strong> yet.</p>
+                <button class="ghost-btn" onclick={buildVaultGraph}
+                  >↻ Rebuild with a stronger model</button
+                >
+              </div>
+            {/if}
+            {#if entityNotes.length}
+              <div class="lens-mentions">
+                <div class="label">
+                  Notes mentioning {selectedEntity.name} · {entityNotes.length}
+                </div>
+                <div class="mention-grid">
+                  {#each entityNotes as docId (docId)}
+                    <button class="mention nb-hov" onclick={() => showSource(docId)}>
+                      <span class="tf-ic">{@render ic('file', 15)}</span>
+                      <span class="mention-nm">{docId}</span>
+                      <span class="mention-go">{@render ic('arrow', 14)}</span>
+                    </button>
+                  {/each}
+                </div>
+              </div>
+            {/if}
+          {:else}
+            <div class="center-empty">
+              <span class="empty-ic">{@render ic('graph', 26)}</span>
+              <p>Pick an entity to see how it connects across your vault.</p>
+            </div>
+          {/if}
+        </div>
+      {:else if mode === 'write'}
+        <!-- NOTE — EDIT IN PLACE -->
+        <div class="note-scroll">
+          <div class="note-col">
+            <div class="note-head">
+              <div class="breadcrumb">
+                <span>{draftFolder || 'notes'}</span><span class="slash">/</span><span class="mono"
+                  >{(editingDocId ?? draftTitle) + (editingDocId ? '' : '.md')}</span
+                >
+              </div>
+              <div class="note-actions">
+                <button
+                  class="act-btn primary nb-press"
+                  onclick={saveNote}
+                  disabled={!ready || savingNote}
+                  >{@render ic('check', 14)} {savingNote ? 'Saving…' : 'Done'}</button
+                >
+              </div>
+            </div>
+            <input
+              class="title-input"
+              bind:value={draftTitle}
+              placeholder="Note title"
+              disabled={savingNote}
+            />
+            <div class="edit-toolbar">
+              <select
+                class="tpl-select"
+                disabled={savingNote}
+                title="Insert a template"
+                onchange={(e) => {
+                  applyTemplate(e.currentTarget.value);
+                  e.currentTarget.selectedIndex = 0;
+                }}
+              >
+                <option value="">Template ▾</option>
+                {#each BUILTIN_TEMPLATES as t (t.id)}<option value={t.id}>{t.label}</option>{/each}
+              </select>
+              {#if !editingDocId}<input
+                  class="folder-input mono"
+                  bind:value={draftFolder}
+                  placeholder="folder"
+                  title="Folder, e.g. clients/acme"
+                  disabled={savingNote}
+                />{/if}
+              <span class="md-tag">Markdown</span>
+            </div>
+            <div class="body-wrap">
+              <textarea
+                class="body-input mono"
+                bind:this={bodyEl}
+                bind:value={draftBody}
+                placeholder="Write in Markdown… type [[ to link a note"
+                disabled={savingNote}
+                oninput={onBodyInput}
+                onkeyup={onBodyInput}
+                onclick={onBodyInput}
+              ></textarea>
+              {#if wlState && wlState.suggestions.length}
+                <ul class="wl-menu">
+                  {#each wlState.suggestions as s (s.docId)}
+                    <li>
+                      <button
+                        class="wl-item nb-hov"
+                        onmousedown={(e) => e.preventDefault()}
+                        onclick={() => pickWikilink(s.title)}
+                        ><span>{s.title}</span><span class="mono dim">{s.docId}</span></button
+                      >
+                    </li>
+                  {/each}
+                </ul>
               {/if}
-              {#if entityNotes.length}
-                <div class="block-h">
-                  📄 Notes mentioning {selectedEntity.name} — {entityNotes.length}
+            </div>
+            <div class="edit-foot">
+              Saved locally · <span class="mono">{editingDocId ?? `notes/${draftTitle}.md`}</span> ·
+              re-embeds on Done{#if editMsg}
+                · {editMsg}{/if}
+            </div>
+          </div>
+        </div>
+      {:else}
+        <!-- NOTE — READ -->
+        <div class="note-scroll">
+          <div class="note-col">
+            {#if activeNote}
+              <div class="note-head">
+                <div class="breadcrumb">
+                  <span>{activeNote.docId.split('/').slice(0, -1).join('/') || 'notes'}</span><span
+                    class="slash">/</span
+                  ><span class="mono">{activeNote.docId.split('/').pop()}</span>
                 </div>
-                {#each entityNotes as docId (docId)}
-                  <button class="src" onclick={() => showSource(docId)}>
-                    <span class="src-n">{docId}</span>
-                  </button>
-                {/each}
+                <div class="note-actions">
+                  {#if !activeNote.sourcePath}<button
+                      class="act-btn nb-hov nb-press"
+                      onclick={() => editNote(activeNote)}>{@render ic('edit', 14)} Edit</button
+                    >{/if}
+                  <button
+                    class="icon-btn nb-hov nb-press"
+                    onclick={() => renameNoteAction(activeNote)}
+                    title="Rename">{@render ic('link', 15)}</button
+                  >
+                  <button
+                    class="icon-btn nb-hov nb-press"
+                    onclick={(e) => openCtxMenu(e, 'file', activeNote.docId)}
+                    title="More">{@render ic('dots', 15)}</button
+                  >
+                </div>
+              </div>
+              {#if activeNote.sourcePath}<div class="source-link">
+                  source: {activeNote.sourcePath} — original preserved, never edited
+                </div>{/if}
+              <h1 class="note-title">{activeNote.title}</h1>
+              {#if activeNote.kind}<span class="kind-badge">{activeNote.kind}</span>{/if}
+              {#if activeSpan}
+                {@const seg = buildHighlightSegments(
+                  activeNote.text,
+                  activeSpan.charStart,
+                  activeSpan.charEnd
+                )}
+                <article class="prose">{seg.pre}<mark>{seg.hit}</mark>{seg.post}</article>
+              {:else}
+                <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+                <article
+                  class="prose"
+                  role="document"
+                  onclick={onRenderedClick}
+                  onkeydown={(e) =>
+                    e.key === 'Enter' && onRenderedClick(e as unknown as MouseEvent)}
+                >
+                  {@html renderMarkdown(activeNote.text, { resolveLink: resolveNoteLink })}
+                </article>
+              {/if}
+              {#if activeBacklinks.length || activeUnlinked.length}
+                <div class="mentions">
+                  {#if activeBacklinks.length}
+                    <div class="label">Linked mentions · {activeBacklinks.length}</div>
+                    {#each activeBacklinks as bl (bl.docId)}
+                      <button class="mention nb-hov" onclick={() => showSource(bl.docId)}
+                        ><span class="mono accent">{bl.docId}</span><span class="mention-pv"
+                          >{bl.title}{bl.count > 1 ? ` ×${bl.count}` : ''}</span
+                        ></button
+                      >
+                    {/each}
+                  {/if}
+                  {#if activeUnlinked.length}
+                    <div class="label mt">Unlinked mentions · {activeUnlinked.length}</div>
+                    {#each activeUnlinked as um (um.docId)}
+                      <button class="mention nb-hov" onclick={() => showSource(um.docId)}
+                        ><span class="mono accent">{um.title}</span><span class="mention-pv"
+                          >{um.snippet}</span
+                        ></button
+                      >
+                    {/each}
+                  {/if}
+                </div>
               {/if}
             {:else}
-              <div class="empty-doc">
-                <div class="empty-emoji">🕸</div>
-                <p>Pick an entity to see how it connects across your vault.</p>
-                {#if !entityIndex.length}
-                  <p class="hint">
-                    Build the graph first — it extracts entities and relations from your notes.
-                  </p>
-                {/if}
+              <div class="center-empty">
+                <span class="empty-ic">{@render ic('file', 26)}</span>
+                <p>
+                  Select a note from the sidebar, or <button class="link-btn" onclick={startNewNote}
+                    >write a new one</button
+                  >.
+                </p>
+                <p class="dim sm">
+                  Right-click the tree to add · rename · move · delete. Drag a note onto a folder to
+                  move it.
+                </p>
+                <div class="empty-cta">
+                  <button class="ghost-btn" onclick={startNewNote}
+                    >{@render ic('plus', 14)} New note</button
+                  >
+                  <button class="ghost-btn" onclick={openDailyNote}>Today</button>
+                  <button class="ghost-btn" onclick={() => fileInput?.click()}>Import files</button>
+                </div>
               </div>
             {/if}
           </div>
+        </div>
+      {/if}
+    </section>
+
+    <!-- ASK RAIL -->
+    <aside class="rail">
+      <div class="rail-head">
+        <span class="rail-title">Ask</span>
+        <span class="rail-scope"
+          >scoped to <span class="mono">{scope ? scopeLabel(scope) : 'whole vault'}</span></span
+        >
+        <span class="spacer"></span>
+        <kbd>⌘J</kbd>
+      </div>
+
+      <div class="rail-body">
+        {#if busy || answer || hits.length}
+          {#if query}<div class="ask-bubble">{query}</div>{/if}
+          {#if busy && !answer}<div class="rail-loading">
+              <span class="spinner"></span><span>{status}</span>
+            </div>{/if}
+          {#if answer}
+            <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+            <article
+              class="prose answer"
+              role="document"
+              onclick={onRenderedClick}
+              onkeydown={(e) => e.key === 'Enter' && onRenderedClick(e as unknown as MouseEvent)}
+            >
+              {@html answerHtml}{#if busy}<span class="nb-cursor"></span>{/if}
+            </article>
+          {/if}
+          {#if hits.length}
+            {@const usage = answerUsage(
+              hits.map((h) => h.chunkId),
+              cites.map((c) => c.chunkId)
+            )}
+            <div class="used-strip">
+              {#if usage.count > 0}<span class="us-ok"
+                  >{@render ic('check', 13)} used {usage.count}/{hits.length}</span
+                >{/if}
+              {#if graphInfo}<span class="us-div"></span><span class="us-graph">{graphInfo}</span
+                >{/if}
+            </div>
+            <div class="label">Sources</div>
+            <div class="src-list">
+              {#each hits as h, i (h.chunkId)}
+                {@const used = usage.used.has(h.chunkId)}
+                {@const viaGraph = graphExpandedIds.has(h.chunkId)}
+                <button class="src-row nb-hov" class:used onclick={() => jumpTo(h.chunkId)}>
+                  <span class="src-n">#{i + 1}</span>
+                  <span class="src-path mono">{h.docId}</span>
+                  {#if viaGraph}<span class="src-graph"
+                      >↳ {(graphShared.get(h.chunkId)?.sharedEntities ?? []).join(', ')}</span
+                    >{:else}<span class="src-why">vector</span>{/if}
+                  <span class="src-score mono">{h.score.toFixed(2)}</span>
+                </button>
+              {/each}
+            </div>
+            {#if graph}
+              <div class="micromap">
+                <div class="label sm">Retrieval sub-graph</div>
+                <svg
+                  width="100%"
+                  height={32 + graph.nodes.filter((n) => n.kind === 'chunk').length * 26}
+                  viewBox="0 0 300 {32 + graph.nodes.filter((n) => n.kind === 'chunk').length * 26}"
+                >
+                  {#each graph.edges as e, i (e.to)}
+                    <line
+                      x1="34"
+                      y1="20"
+                      x2="250"
+                      y2={26 + i * 26}
+                      stroke="var(--line-strong)"
+                      stroke-width={e.width}
+                      stroke-dasharray={e.viaGraph ? '4 3' : ''}
+                    />
+                  {/each}
+                  <circle cx="34" cy="20" r="6" fill="var(--accent)" />
+                  {#each graph.nodes.filter((n) => n.kind === 'chunk') as n, i (n.id)}
+                    <circle
+                      cx="250"
+                      cy={26 + i * 26}
+                      r="4.5"
+                      fill={n.viaGraph ? 'var(--accent)' : 'var(--surface)'}
+                      stroke={n.viaGraph ? 'var(--accent)' : 'var(--line-strong)'}
+                      stroke-width="1.5"
+                    />
+                    <text x="240" y={29 + i * 26} class="mm-label" text-anchor="end">{n.label}</text
+                    >
+                  {/each}
+                </svg>
+              </div>
+            {/if}
+            <button class="compile-btn nb-press" onclick={openCompileFromHits}
+              >{@render ic('box', 16)} Compile this context</button
+            >
+          {/if}
+        {:else}
+          <p class="rail-idle">
+            Ask anything about your notes. Answers are grounded in your vault and cite their
+            sources.
+          </p>
+          <div class="label">Try</div>
+          <div class="try-list">
+            {#each ['What did we decide and why?', 'Who owns what — and how does it connect?', 'Summarize the open risks'] as s}
+              <button
+                class="try nb-hov"
+                onclick={() => {
+                  query = s;
+                  ask();
+                }}
+                disabled={!ready}>{s}</button
+              >
+            {/each}
+          </div>
         {/if}
       </div>
-    </section>
+
+      <div class="composer">
+        <div class="composer-box">
+          <textarea
+            bind:value={query}
+            rows="1"
+            placeholder="Ask a question…"
+            disabled={busy}
+            onkeydown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                ask();
+              }
+            }}
+          ></textarea>
+          <button
+            class="send"
+            class:on={query.trim()}
+            onclick={ask}
+            disabled={!ready || busy}
+            aria-label="Ask">{@render ic('send', 16)}</button
+          >
+        </div>
+        <div class="composer-foot">
+          <div class="mode-chips">
+            <button
+              class="mchip nb-hov"
+              class:on={answerMode === 'reason'}
+              onclick={() => (answerMode = 'reason')}
+              title="Reason with your notes">{@render ic('bolt', 12)} Reason</button
+            >
+            <button
+              class="mchip nb-hov"
+              class:on={answerMode === 'grounded'}
+              onclick={() => (answerMode = 'grounded')}
+              title="Strict, verifiable">Grounded</button
+            >
+            <button
+              class="mchip nb-hov"
+              class:on={graphRagOn}
+              onclick={() => (graphRagOn = !graphRagOn)}
+              title="Pull in chunks connected through shared entities"
+              >{@render ic('graph', 12)} GraphRAG</button
+            >
+          </div>
+          <span class="dim sm">Runs on your device</span>
+        </div>
+      </div>
+    </aside>
   </div>
 
-  {#snippet treeView(nodes: TreeNode[])}
-    {#each nodes as node (node.path)}
-      {#if node.kind === 'folder'}
-        <button
-          class="tree-folder"
-          class:drop={dropFolder === node.path}
-          onclick={() => toggleFolder(node.path)}
-          oncontextmenu={(e) => openCtxMenu(e, 'folder', node.path)}
-          ondragover={(e) => onTreeDragOverFolder(e, node.path)}
-          ondragleave={() => {
-            if (dropFolder === node.path) dropFolder = null;
-          }}
-          ondrop={(e) => onTreeDropFolder(e, node.path)}
-        >
-          <span class="tree-caret">{collapsed.has(node.path) ? '▸' : '▾'}</span>📁 {node.name}
-        </button>
-        {#if !collapsed.has(node.path)}
-          <div class="tree-children">{@render treeView(node.children)}</div>
-        {/if}
-      {:else}
-        {@const kind = vault.find((n) => n.docId === node.docId)?.kind}
-        <button
-          class="tree-file"
-          class:active={activeDoc === node.docId}
-          class:dragging={dragDocId === node.docId}
-          draggable="true"
-          onclick={() => node.docId && showSource(node.docId)}
-          oncontextmenu={(e) => openCtxMenu(e, 'file', node.docId ?? '')}
-          ondragstart={(e) => node.docId && onTreeDragStart(e, node.docId)}
-          ondragend={onTreeDragEnd}
-        >
-          📄 {node.name}{#if kind}<span class="badge">{kind}</span>{/if}
-        </button>
-      {/if}
-    {/each}
-  {/snippet}
+  <input
+    class="hidden-input"
+    type="file"
+    multiple
+    accept=".pdf,.csv,.txt,.md,.markdown,.text"
+    bind:this={fileInput}
+    onchange={(e) => ingestFiles(e.currentTarget.files)}
+  />
 
-  {#if preview}
-    <div class="popover" style="left: {preview.x}px; top: {preview.y}px">{preview.text}</div>
-  {/if}
+  <!-- ───────── OVERLAYS ───────── -->
+  {#if preview}<div class="popover" style="left:{preview.x}px; top:{preview.y}px">
+      {preview.text}
+    </div>{/if}
 
   {#if switcherOpen}
-    <!-- Quick switcher (FR-NAV-001) -->
     <div
-      class="switcher-overlay"
+      class="overlay center-top"
       role="button"
       tabindex="-1"
-      aria-label="Close switcher"
+      aria-label="Close"
       onclick={() => (switcherOpen = false)}
-      onkeydown={(e) => e.key === 'Enter' && (switcherOpen = false)}
+      onkeydown={(e) => e.key === 'Escape' && (switcherOpen = false)}
     >
       <div
-        class="switcher"
+        class="switcher nb-rise"
         role="dialog"
         tabindex="-1"
         aria-label="Quick switcher"
         onclick={(e) => e.stopPropagation()}
         onkeydown={(e) => {
-          if (e.key === 'Enter' && switcherResults[0]) chooseSwitch(switcherResults[0].docId);
+          if (e.key === 'Enter') {
+            if (switcherQuery.trim() && !switcherResults.length) {
+              query = switcherQuery;
+              switcherOpen = false;
+              ask();
+            } else if (switcherResults[0]) chooseSwitch(switcherResults[0].docId);
+          }
         }}
       >
-        <input
-          id="switcher-input"
-          class="switcher-input"
-          bind:value={switcherQuery}
-          placeholder="Jump to a note…"
-          autocomplete="off"
-        />
-        <ul class="switcher-list">
+        <div class="sw-input">
+          <span class="dim">{@render ic('search', 17)}</span>
+          <input
+            id="switcher-input"
+            bind:value={switcherQuery}
+            placeholder="Jump to a note, entity — or ask a question…"
+            autocomplete="off"
+          />
+          <kbd>esc</kbd>
+        </div>
+        <ul class="sw-list">
+          {#if switcherQuery.trim()}
+            <li>
+              <button
+                class="sw-ask nb-hov"
+                onclick={() => {
+                  query = switcherQuery;
+                  switcherOpen = false;
+                  ask();
+                }}
+                >{@render ic('bolt', 16)}<span
+                  >Ask your vault: <strong>“{switcherQuery}”</strong></span
+                >{@render ic('arrow', 15)}</button
+              >
+            </li>
+          {/if}
           {#each switcherResults as r (r.docId)}
             <li>
-              <button class="switcher-item" onclick={() => chooseSwitch(r.docId)}>
-                <span class="wl-title">{r.title}</span>
-                <span class="wl-doc">{r.docId}</span>
-              </button>
+              <button class="sw-item nb-hov" onclick={() => chooseSwitch(r.docId)}
+                ><span class="dim">{@render ic('file', 15)}</span><span>{r.title}</span><span
+                  class="mono dim">{r.docId}</span
+                ></button
+              >
             </li>
           {:else}
-            <li class="switcher-empty">No matching notes</li>
+            {#if !switcherQuery.trim()}<li class="sw-empty">No matching notes</li>{/if}
           {/each}
         </ul>
       </div>
@@ -2792,175 +2811,165 @@
   {/if}
 
   {#if compileOpen}
-    <!-- Context Compiler (FR-CTX-*): compact, token-counted share to another LLM. -->
     <div
-      class="switcher-overlay"
+      class="overlay to-right"
       role="button"
       tabindex="-1"
-      aria-label="Close compiler"
+      aria-label="Close"
       onclick={() => (compileOpen = false)}
       onkeydown={(e) => e.key === 'Escape' && (compileOpen = false)}
     >
       <div
-        class="compiler"
+        class="sheet nb-sheet-in"
         role="dialog"
         tabindex="-1"
         aria-label="Context Compiler"
         onclick={(e) => e.stopPropagation()}
         onkeydown={(e) => e.key === 'Escape' && (compileOpen = false)}
       >
-        <div class="compiler-head">
-          <strong>📦 Share to another LLM</strong>
-          <span class="compiler-sub"
-            >{compileFrom === 'answer' ? 'retrieved context' : 'scope'}: {compileSources.length} source(s){scope
-              ? ` · ${scopeLabel(scope)}`
-              : ''}</span
+        <div class="sheet-head">
+          <span class="accent">{@render ic('box', 18)}</span><strong>Compile context</strong><span
+            class="spacer"
+          ></span><button class="icon-btn nb-hov" onclick={() => (compileOpen = false)}
+            >{@render ic('close', 15)}</button
           >
-          <button class="back" onclick={() => (compileOpen = false)}>✕</button>
         </div>
-        <div class="compiler-controls">
-          <label>
-            Target model
-            <select bind:value={compileModel}>
-              {#each COMPILE_MODELS as m (m)}<option value={m}>{m}</option>{/each}
-            </select>
-          </label>
-          {#if compileFrom === 'answer'}
-            <label title="Token budget for the relevant-~5% selection (CE1)">
-              Budget
-              <input type="number" min="200" step="200" bind:value={compileBudget} />
-            </label>
-          {/if}
-          <label class="redact">
-            Redact (comma-separated)
-            <input bind:value={compileRedact} placeholder="Acme, John Doe, 555-…" />
-          </label>
-        </div>
-        <label class="task-input">
-          Task (optional) — makes the payload paste-and-go
-          <input bind:value={compileTask} placeholder="e.g. How do we de-risk this deal?" />
-        </label>
-        <div class="pii-row">
-          <span class="pii-label">Scrub PII:</span>
-          {#each PII_TYPES as t (t)}
-            <label class="pii-chip">
-              <input
-                type="checkbox"
-                checked={compilePii.has(t)}
-                onchange={() => {
-                  const next = new Set(compilePii);
-                  next.has(t) ? next.delete(t) : next.add(t);
-                  compilePii = next;
-                }}
-              />{t}</label
-            >
-          {/each}
-        </div>
-        {#if entityIndex.length}
-          <div class="pii-row">
-            <span class="pii-label">Redact entity:</span>
-            <select
-              bind:value={redactEntityId}
-              onchange={applyEntityRedaction}
-              title="Remove this entity (all its aliases) from the payload"
-            >
-              <option value="">— none —</option>
-              {#each entityIndex as e (e.id)}
-                <option value={e.id}>{e.name}</option>
-              {/each}
-            </select>
-            <label
-              class="pii-chip"
-              title="Also redact its connected people/projects from the graph"
-            >
-              <input
-                type="checkbox"
-                checked={redactConnected}
-                onchange={(ev) => {
-                  redactConnected = (ev.currentTarget as HTMLInputElement).checked;
-                  void applyEntityRedaction();
-                }}
-              />+ connected
-            </label>
-          </div>
-        {/if}
-        {#if redactPreview.length}
-          <div
-            class="redact-preview"
-            title="Exactly what will be removed before anything is copied"
-          >
-            🛡 Will remove:
-            {#each redactPreview as p (p.label + p.pattern)}
-              <span class="redact-pill">{p.label} ×{p.count}</span>
-            {/each}
-          </div>
-        {/if}
-        {#if compileResult}
-          <div class="compiler-meta">
-            ~<strong>{compileResult.manifest.tokenCount}</strong> tokens · tokenizer
-            {compileResult.manifest.tokenizer}
-          </div>
-          <!-- CE5 — cost honesty: estimated cost + context-window fit for the target model. -->
-          <div class="cost-line" class:over={!compileResult.manifest.cost.fitsWindow}>
-            💰 {formatCost(compileResult.manifest.cost)}
-          </div>
-          <div class="compiler-meta">
-            <span class="consent"
-              >⚠ {compileSources.length} source(s) will leave the device when you copy/paste</span
-            >
-          </div>
-          <textarea class="compiler-xml" readonly rows="12" value={compileResult.xml}></textarea>
-          <div class="compiler-actions">
-            <button class="ask" onclick={copyCompiled}>⧉ Copy</button>
-            <button class="ghost" onclick={downloadCompiled}>⤓ Download .xml</button>
-            {#if exportAudit.length}
-              <span class="audit-count" title="Local export audit (hashes + counts only)"
-                >📝 {exportAudit.length} export{exportAudit.length > 1 ? 's' : ''} logged</span
+        <div class="sheet-body">
+          <div class="step">
+            <div class="step-h"><span class="step-n">1</span> Share</div>
+            <p class="dim sm">
+              The most relevant ~5% of your vault — not the whole folder. {compileSources.length} source(s){scope
+                ? ` · ${scopeLabel(scope)}`
+                : ''}.
+            </p>
+            <label class="field"
+              >Target model
+              <select bind:value={compileModel}
+                >{#each COMPILE_MODELS as m (m)}<option value={m}>{m}</option>{/each}</select
               >
-            {/if}
+            </label>
+            {#if compileFrom === 'answer'}<label class="field"
+                >Token budget<input
+                  type="number"
+                  min="200"
+                  step="200"
+                  bind:value={compileBudget}
+                /></label
+              >{/if}
+            <label class="field"
+              >Task (optional)<input
+                bind:value={compileTask}
+                placeholder="e.g. How do we de-risk this deal?"
+              /></label
+            >
           </div>
-          <!-- CE4 — paste a frontier-model answer back; its [path#seq] / [#n] citations resolve to notes. -->
-          <details class="paste-back">
-            <summary>↩ Paste the model's answer back to navigate its citations</summary>
-            <textarea
-              bind:value={pasteBack}
-              rows="4"
-              placeholder="Paste GPT/Claude's answer here — [path#seq] citations become clickable jumps to your notes."
-            ></textarea>
-            {#if pasteResolved}
-              <div class="paste-refs">
-                {#each pasteResolved.refs as r, i (i)}
-                  {#if r.resolved && r.chunkId}
-                    {@const cid = r.chunkId}
-                    <button
-                      class="paste-ref"
-                      onclick={() => {
-                        compileOpen = false;
-                        jumpTo(cid);
-                      }}>{r.raw} → open</button
-                    >
-                  {:else}
-                    <span class="paste-ref broken" title="Couldn't find this source in the vault"
-                      >{r.raw} ✕</span
-                    >
-                  {/if}
-                {/each}
-                {#if pasteResolved.refs.length === 0}
-                  <span class="hint">No [path#seq] or [#n] citations found in the pasted text.</span
-                  >
-                {/if}
+          <div class="step">
+            <div class="step-h"><span class="step-n">2</span> Redact</div>
+            <label class="field"
+              >Redact text (comma-separated)<input
+                bind:value={compileRedact}
+                placeholder="Acme, John Doe, 555-…"
+              /></label
+            >
+            <div class="pii-row">
+              <span class="dim sm">Scrub PII:</span>
+              {#each PII_TYPES as t (t)}
+                <label class="pii-chip" class:on={compilePii.has(t)}
+                  ><input
+                    type="checkbox"
+                    checked={compilePii.has(t)}
+                    onchange={() => {
+                      const n = new Set(compilePii);
+                      n.has(t) ? n.delete(t) : n.add(t);
+                      compilePii = n;
+                    }}
+                  />{t}</label
+                >
+              {/each}
+            </div>
+            {#if entityIndex.length}
+              <div class="pii-row">
+                <span class="dim sm">Redact entity:</span>
+                <select bind:value={redactEntityId} onchange={applyEntityRedaction}
+                  ><option value="">— none —</option>{#each entityIndex as e (e.id)}<option
+                      value={e.id}>{e.name}</option
+                    >{/each}</select
+                >
+                <label class="pii-chip" class:on={redactConnected}
+                  ><input
+                    type="checkbox"
+                    checked={redactConnected}
+                    onchange={(ev) => {
+                      redactConnected = ev.currentTarget.checked;
+                      void applyEntityRedaction();
+                    }}
+                  />+ connected</label
+                >
               </div>
             {/if}
-          </details>
-        {:else}
-          <div class="compiler-meta">Nothing to compile.</div>
-        {/if}
+            {#if redactPreview.length}<div class="remove-box">
+                {@render ic('eyeoff', 14)} Will remove: {#each redactPreview as p (p.label + p.pattern)}<span
+                    class="remove-pill">{p.label} ×{p.count}</span
+                  >{/each}
+              </div>{/if}
+          </div>
+          <div class="step">
+            <div class="step-h"><span class="step-n">3</span> Copy</div>
+            {#if compileResult}
+              <div class="stat-row">
+                <div class="stat">
+                  <span class="dim sm">Tokens</span><strong class="mono"
+                    >{compileResult.manifest.tokenCount}</strong
+                  >
+                </div>
+                <div class="stat">
+                  <span class="dim sm">Est. cost</span><strong
+                    class="mono ok"
+                    class:over={!compileResult.manifest.cost.fitsWindow}
+                    >{formatCost(compileResult.manifest.cost)}</strong
+                  >
+                </div>
+              </div>
+              <textarea class="payload mono" readonly rows="10" value={compileResult.xml}
+              ></textarea>
+              <div class="sheet-actions">
+                <button class="act-btn primary nb-press" onclick={copyCompiled}
+                  >{@render ic('copy', 15)} Copy</button
+                >
+                <button class="act-btn nb-hov" onclick={downloadCompiled}
+                  >{@render ic('download', 15)} .xml</button
+                >
+                <span class="dim sm"
+                  >⚠ {compileSources.length} source(s) leave the device on copy</span
+                >
+              </div>
+              <details class="paste-back">
+                <summary>↩ Paste the model's answer back to navigate its citations</summary>
+                <textarea
+                  class="mono"
+                  bind:value={pasteBack}
+                  rows="4"
+                  placeholder="Paste GPT/Claude's answer — [path#seq] citations become clickable jumps."
+                ></textarea>
+                {#if pasteResolved}<div class="paste-refs">
+                    {#each pasteResolved.refs as r, i (i)}{#if r.resolved && r.chunkId}{@const cid =
+                          r.chunkId}<button
+                          class="paste-ref nb-hov"
+                          onclick={() => {
+                            compileOpen = false;
+                            jumpTo(cid);
+                          }}>{r.raw} → open</button
+                        >{:else}<span class="paste-ref broken">{r.raw} ✕</span>{/if}{/each}
+                  </div>{/if}
+              </details>
+            {:else}<p class="dim">Nothing to compile.</p>{/if}
+          </div>
+        </div>
       </div>
     </div>
   {/if}
 
   {#if ctxMenu}
-    <!-- File-tree context menu (FR-NAV-002). A full-screen backdrop closes it on any outside click. -->
     <div
       class="ctx-backdrop"
       role="presentation"
@@ -2973,141 +2982,133 @@
     <div class="ctx-menu" style="left:{ctxMenu.x}px; top:{ctxMenu.y}px" role="menu">
       {#if ctxMenu.kind === 'file'}
         {@const note = vault.find((n) => n.docId === ctxMenu?.path)}
-        <button class="ctx-item" role="menuitem" onclick={() => note && showSource(note.docId)}
-          >📄 Open</button
+        <button
+          class="ctx-item nb-hov"
+          role="menuitem"
+          onclick={() => note && showSource(note.docId)}>Open</button
         >
         {#if note && !note.sourcePath}
           <button
-            class="ctx-item"
+            class="ctx-item nb-hov"
             role="menuitem"
             onclick={() => {
               const n = note;
               closeCtxMenu();
               if (n) editNote(n);
-            }}>✎ Edit</button
+            }}>Edit</button
           >
           <button
-            class="ctx-item"
+            class="ctx-item nb-hov"
             role="menuitem"
             onclick={() => {
               const n = note;
               closeCtxMenu();
               if (n) renameNoteAction(n);
-            }}>✏️ Rename</button
+            }}>Rename</button
           >
         {/if}
         <button
-          class="ctx-item"
+          class="ctx-item nb-hov"
           role="menuitem"
           onclick={() => {
             const n = note;
             closeCtxMenu();
             if (n) moveNoteAction(n);
-          }}>📂 Move…</button
+          }}>Move…</button
         >
         <button
-          class="ctx-item danger"
+          class="ctx-item danger nb-hov"
           role="menuitem"
           onclick={() => {
             const p = ctxMenu?.path;
             closeCtxMenu();
             if (p) deleteNote(p);
-          }}>🗑 Delete</button
+          }}>Delete</button
         >
       {:else if ctxMenu.kind === 'folder'}
-        <button class="ctx-item" role="menuitem" onclick={() => newNoteIn(ctxMenu?.path ?? 'notes')}
-          >✎ New note here</button
-        >
-        <button class="ctx-item" role="menuitem" onclick={() => newFolderIn(ctxMenu?.path ?? '')}
-          >📁 New folder</button
-        >
-        <button class="ctx-item" role="menuitem" onclick={() => renameFolder(ctxMenu?.path ?? '')}
-          >✏️ Rename folder</button
+        <button
+          class="ctx-item nb-hov"
+          role="menuitem"
+          onclick={() => newNoteIn(ctxMenu?.path ?? 'notes')}>New note here</button
         >
         <button
-          class="ctx-item danger"
+          class="ctx-item nb-hov"
           role="menuitem"
-          onclick={() => deleteFolder(ctxMenu?.path ?? '')}>🗑 Delete folder</button
+          onclick={() => newFolderIn(ctxMenu?.path ?? '')}>New folder</button
+        >
+        <button
+          class="ctx-item nb-hov"
+          role="menuitem"
+          onclick={() => renameFolder(ctxMenu?.path ?? '')}>Rename folder</button
+        >
+        <button
+          class="ctx-item danger nb-hov"
+          role="menuitem"
+          onclick={() => deleteFolder(ctxMenu?.path ?? '')}>Delete folder</button
         >
       {:else}
-        <button class="ctx-item" role="menuitem" onclick={() => newNoteIn('notes')}
-          >✎ New note</button
+        <button class="ctx-item nb-hov" role="menuitem" onclick={() => newNoteIn('notes')}
+          >New note</button
         >
-        <button class="ctx-item" role="menuitem" onclick={() => newFolderIn('')}
-          >📁 New folder</button
+        <button class="ctx-item nb-hov" role="menuitem" onclick={() => newFolderIn('')}
+          >New folder</button
         >
       {/if}
     </div>
   {/if}
 
   {#if modelGate}
-    <!-- Startup model gate (FR-MDL-005): pick a model to warm up in the background before Ask/build. -->
-    <div class="switcher-overlay" role="presentation">
-      <div class="gate" role="dialog" aria-modal="true" aria-label="Choose a model">
+    <div class="overlay center" role="presentation">
+      <div class="gate nb-rise" role="dialog" aria-modal="true" aria-label="Choose a model">
         <div class="gate-head">
-          <strong>✦ Warm up a local AI model</strong>
-          <p class="gate-sub">
-            Nebula runs the model on your device. Pick one to load in the background now — so chat
-            and graph-building are ready the moment you need them. It downloads once, then it's
-            cached.
+          <strong>On-device chat model</strong>
+          <p class="dim sm">
+            Runs on your GPU via WebGPU · downloaded once, then offline. No account, no upload.
           </p>
         </div>
         {#if gpu?.ok}
           {@const rec = recommendModel(true)}
-          {#if rec}
-            <button class="gate-auto" onclick={chooseAutoModel}>
-              <span>★ Auto — {rec.label}</span>
-              <small>recommended for your GPU · {formatSize(rec.sizeMB)}</small>
-            </button>
-          {/if}
-          <div class="gate-or">or choose a model</div>
+          {#if rec}<button class="gate-auto nb-press" onclick={chooseAutoModel}
+              ><span>★ Auto — {rec.label}</span><small class="dim"
+                >recommended for your GPU · {formatSize(rec.sizeMB)}</small
+              ></button
+            >{/if}
           <div class="gate-list">
             {#each MODELS as m (m.id)}
               {@const cached = cachedModels.has(m.id)}
-              <div class="gate-model" class:current={m.id === modelId} class:cached>
+              <div class="gate-row" class:current={m.id === modelId}>
                 <button
-                  class="gate-model-pick"
+                  class="gate-pick nb-hov"
                   onclick={() => chooseModel(m.id)}
                   disabled={deletingModel === m.id}
                 >
-                  <span class="gate-model-label"
-                    >{m.label}{#if m.multilingual}<span class="badge">multi</span>{/if}</span
+                  <span class="gate-nm"
+                    >{m.label}{#if m.multilingual}<span class="mini-badge">multilingual</span
+                      >{/if}</span
                   >
-                  <span class="gate-model-size">
-                    {#if cached}
-                      <span
-                        class="cached-badge"
-                        title="Already downloaded to this browser — loads instantly, no download"
-                        >✓ on disk</span
-                      >
-                    {:else}
-                      {formatSize(m.sizeMB)}{#if needsOomAck(m.id)}<span
-                          class="warn-badge"
-                          title="Large model — a bigger one-time download and more VRAM">⬇</span
-                        >{/if}
-                    {/if}
-                  </span>
+                  <span class="gate-sz mono"
+                    >{#if cached}<span class="ok">✓ ready</span>{:else}{formatSize(
+                        m.sizeMB
+                      )}{#if needsOomAck(m.id)}
+                        ↓{/if}{/if}</span
+                  >
                 </button>
-                {#if cached}
-                  <button
-                    class="gate-model-del"
-                    title="Remove {m.label} from this browser (free ~{formatSize(m.sizeMB)})"
-                    aria-label="Remove {m.label} from this browser"
+                {#if cached}<button
+                    class="gate-del nb-hov"
+                    title="Remove from this browser"
                     onclick={() => deleteModelFromCache(m.id)}
                     disabled={!!deletingModel}>{deletingModel === m.id ? '…' : '🗑'}</button
-                  >
-                {/if}
+                  >{/if}
               </div>
             {/each}
           </div>
           <button class="gate-skip" onclick={closeModelGate}
-            >Skip for now — semantic search, notes &amp; graph still work</button
+            >Skip — semantic search, notes & graph still work</button
           >
         {:else}
           <div class="gate-nowebgpu">
-            ⚠ No WebGPU detected — on-device chat/generation is unavailable here, but semantic
-            search, notes, and the file tree all work. Use Chrome or Edge on a GPU-capable device to
-            enable chat.
+            ⚠ No WebGPU — on-device chat is unavailable here, but semantic search, notes, and the
+            graph all work. Use Chrome/Edge on a GPU-capable device for chat.
           </div>
           <button class="gate-skip" onclick={closeModelGate}>Continue</button>
         {/if}
@@ -3117,1448 +3118,1583 @@
 </main>
 
 <style>
-  :global(body) {
-    margin: 0;
-  }
+  /* ───────── Clean Slate workspace styles (tokens in $lib/styles/tokens.css) ───────── */
   .shell {
+    height: 100vh;
     display: flex;
     flex-direction: column;
-    height: 100vh;
-    font-family: system-ui, sans-serif;
-    color: #1c1c22;
-    background: #fafafb;
+    overflow: hidden;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--ui);
   }
+  .shell.drop {
+    outline: 2px dashed var(--accent);
+    outline-offset: -6px;
+  }
+  .spacer {
+    flex: 1;
+  }
+  .mono {
+    font-family: var(--mono);
+  }
+  .dim {
+    color: var(--muted);
+  }
+  .accent {
+    color: var(--accent);
+  }
+  .ok {
+    color: var(--ok);
+  }
+  .sm {
+    font-size: 12px;
+  }
+  .mt {
+    margin-top: 18px;
+  }
+  .label {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  kbd {
+    font-size: 11px;
+    color: var(--muted);
+    background: var(--surface-alt);
+    border: 1px solid var(--line);
+    border-radius: var(--r-sm);
+    padding: 2px 6px;
+  }
+  .spinner {
+    width: 13px;
+    height: 13px;
+    border: 2px solid var(--line-strong);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: nbSpin 0.8s linear infinite;
+    flex: 0 0 auto;
+    display: inline-block;
+  }
+  .spinner.big {
+    width: 22px;
+    height: 22px;
+    border-width: 3px;
+  }
+
+  /* topbar */
   .topbar {
+    height: 53px;
+    flex: 0 0 53px;
     display: flex;
     align-items: center;
-    gap: 0.8rem;
-    padding: 0.55rem 1rem;
-    border-bottom: 1px solid #e4e4ea;
-    background: #fff;
+    gap: 16px;
+    padding: 0 16px;
+    border-bottom: 1px solid var(--line);
+    background: var(--surface);
   }
-  .brand {
-    font-weight: 700;
-    color: #6750a4;
+  .tb-left {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    width: 200px;
   }
-  .tag {
-    font-size: 0.75rem;
-    color: #8a8a90;
+  .brand-name {
+    font-weight: 600;
+    font-size: 16px;
+    letter-spacing: -0.01em;
   }
-  .eject {
-    font: inherit;
-    font-size: 0.76rem;
-    cursor: pointer;
-    background: #efeaf8;
-    color: #6750a4;
-    border: 1px solid #d9cef2;
-    border-radius: 7px;
-    padding: 0.2rem 0.55rem;
+  .tb-center {
+    flex: 1;
+    display: flex;
+    justify-content: center;
   }
-  .bg-index {
-    margin-left: auto;
+  .omnibox {
+    width: 100%;
+    max-width: 540px;
+    height: 36px;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 0 12px;
+    border-radius: var(--r-md);
+    background: var(--surface-alt);
+    border: 1px solid var(--line);
+    color: var(--faint);
+  }
+  .omni-ic {
+    display: inline-flex;
+    color: var(--faint);
+  }
+  .omni-txt {
+    flex: 1;
+    text-align: left;
+    font-size: 13.5px;
+  }
+  .tb-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 232px;
+    justify-content: flex-end;
+  }
+  .icon-btn {
+    width: 32px;
+    height: 32px;
+    display: grid;
+    place-items: center;
+    border-radius: var(--r-sm);
+    border: 1px solid var(--line);
+    background: var(--surface);
+    color: var(--muted);
+  }
+  .pill {
     display: inline-flex;
     align-items: center;
-    gap: 0.35rem;
-    font-size: 0.74rem;
-    color: #6750a4;
-    background: #efeaf8;
-    border-radius: 6px;
-    padding: 1px 8px;
+    gap: 6px;
+    height: 26px;
+    padding: 0 10px;
+    border-radius: var(--r-pill);
+    font-size: 12px;
+    font-weight: 500;
+    white-space: nowrap;
+    border: 1px solid var(--line);
+    background: var(--surface-alt);
+    color: var(--ink-2);
   }
-  .bg-index + .status {
-    margin-left: 0.5rem;
+  .model-pill {
+    cursor: pointer;
   }
-  .status {
-    margin-left: auto;
-    font-size: 0.8rem;
-    color: #6a6a72;
+  .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 999px;
+    flex: 0 0 auto;
+    background: var(--faint);
   }
-  .coi {
-    font-size: 0.72rem;
-    color: #b00020;
-    border: 1px solid currentColor;
-    border-radius: 6px;
-    padding: 1px 6px;
+  .dot.ok {
+    background: var(--ok);
   }
-  .coi.ok {
-    color: #1a7f37;
+  .ok-pill {
+    background: var(--ok-soft);
+    color: var(--ok);
+    border: none;
   }
-  .split {
-    display: flex;
-    flex: 1;
-    min-height: 0;
+  .busy-pill {
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+    border: none;
   }
-  .pane {
-    overflow: auto;
-    padding: 1rem 1.1rem;
-  }
-  .viewer {
-    flex: 1;
-    background: #fff;
-  }
-  .viewer.drop {
-    outline: 2px dashed #6750a4;
-    outline-offset: -8px;
-    background: #faf8ff;
-  }
-  .toolbar {
+
+  /* model banner */
+  .model-banner {
+    height: 38px;
+    flex: 0 0 38px;
     display: flex;
     align-items: center;
-    gap: 0.6rem;
-    margin-bottom: 0.7rem;
-    flex-wrap: wrap;
+    gap: 10px;
+    padding: 0 16px;
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+    font-size: 12.5px;
+    border-bottom: 1px solid var(--accent-rim);
   }
-  .addfiles {
+  .mb-bar {
+    width: 120px;
+    height: 6px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.4);
+    overflow: hidden;
+  }
+  .mb-fill {
+    display: block;
+    height: 100%;
+    background: var(--accent);
+    border-radius: 999px;
+    transition: width 0.3s;
+  }
+  .mb-pct {
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .mb-div {
+    width: 1px;
+    height: 14px;
+    background: var(--accent-rim);
+  }
+  .mb-note {
+    color: var(--accent-ink);
+    opacity: 0.8;
+  }
+
+  /* body grid */
+  .body {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 232px 1fr 384px;
+    min-height: 0;
+  }
+
+  /* sidebar */
+  .sidebar {
+    background: var(--sidebar);
+    border-right: 1px solid var(--line);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .sidebar.drop {
+    outline: 2px solid var(--accent);
+    outline-offset: -3px;
+  }
+  .side-scroll {
+    flex: 1;
+    overflow-y: auto;
+    padding: 14px 10px 8px;
+  }
+  .side-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 6px;
+    margin-bottom: 6px;
+  }
+  .side-head.mt {
+    margin-top: 18px;
+  }
+  .ghost-ic {
+    width: 22px;
+    height: 22px;
+    display: grid;
+    place-items: center;
+    border-radius: var(--r-sm);
+    border: none;
+    background: transparent;
+    color: var(--muted);
+  }
+  .link-btn {
+    border: none;
+    background: none;
+    color: var(--accent);
     font: inherit;
-    font-size: 0.78rem;
+    font-size: 12px;
     cursor: pointer;
-    background: #6750a4;
-    color: #fff;
-    border: 0;
-    border-radius: 7px;
-    padding: 0.25rem 0.7rem;
+    padding: 0;
   }
-  .addfiles:disabled {
-    opacity: 0.5;
+  .tree-folder,
+  .tree-file,
+  .ent-row {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    width: 100%;
+    height: 28px;
+    border-radius: var(--r-sm);
+    cursor: pointer;
+    font-size: 13px;
+    border: none;
+    background: transparent;
+    color: var(--ink-2);
+    text-align: left;
+    padding: 0 8px;
   }
-  .hint {
-    font-size: 0.74rem;
-    color: #9a9aa2;
+  .tree-folder {
+    color: var(--ink);
+    font-weight: 500;
   }
-  .importmsg {
-    font-size: 0.74rem;
-    color: #1a7f37;
+  .caret {
+    display: inline-flex;
+    color: var(--muted);
+    transition: transform 0.15s;
+  }
+  .caret.open {
+    transform: rotate(90deg);
+  }
+  .tree-count {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--faint);
     margin-left: auto;
   }
+  .tree-children {
+    display: contents;
+  }
+  .tree-file {
+    padding-left: 24px;
+  }
+  .tf-ic {
+    display: inline-flex;
+    color: var(--muted);
+    flex: 0 0 auto;
+  }
+  .tf-nm {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .tree-file.active {
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+    font-weight: 600;
+  }
+  .tree-file.active .tf-ic {
+    color: var(--accent-ink);
+  }
+  .tree-file.dragging {
+    opacity: 0.5;
+  }
+  .ent-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+    flex: 0 0 auto;
+  }
+  .ent-nm {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .ent-row.active {
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+  }
+  .open-lens {
+    color: var(--accent);
+    font-weight: 500;
+    margin-top: 2px;
+  }
+  .lens-ic {
+    display: inline-flex;
+    color: var(--accent);
+  }
+  .build-graph {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    width: 100%;
+    padding: 8px 10px;
+    border-radius: var(--r-md);
+    border: 1px solid var(--line);
+    background: var(--surface);
+    color: var(--ink-2);
+    font-size: 12.5px;
+    cursor: pointer;
+  }
+  .tagwrap {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 0 4px;
+  }
+  .tagchip {
+    font-size: 12px;
+    color: var(--muted);
+    padding: 3px 9px;
+    border-radius: var(--r-pill);
+    border: 1px solid var(--line);
+    background: transparent;
+    cursor: pointer;
+  }
+  .tagchip.active {
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+    border-color: var(--accent-rim);
+  }
+  .side-foot {
+    padding: 8px 10px 12px;
+    border-top: 1px solid var(--line);
+  }
+  .scope-pill {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: 38px;
+    padding: 0 11px;
+    border-radius: var(--r-md);
+    border: 1px solid var(--line);
+    background: var(--surface);
+    font-size: 12.5px;
+    color: var(--muted);
+  }
+  .scope-ic {
+    display: inline-flex;
+    color: var(--accent);
+  }
+  .scope-lbl {
+    color: var(--muted);
+  }
+  .scope-select {
+    flex: 1;
+    border: none;
+    background: transparent;
+    font: inherit;
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--ink);
+    cursor: pointer;
+    outline: none;
+  }
+
+  /* center */
+  .center {
+    background: var(--bg);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .note-scroll {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    justify-content: center;
+  }
+  .note-col {
+    width: 100%;
+    max-width: 720px;
+    padding: 26px 48px 60px;
+  }
+  .note-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 18px;
+  }
+  .breadcrumb {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12.5px;
+    color: var(--muted);
+  }
+  .breadcrumb .mono {
+    font-size: 12px;
+  }
+  .slash {
+    color: var(--faint);
+  }
+  .note-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .act-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 30px;
+    padding: 0 12px;
+    border-radius: var(--r-md);
+    border: 1px solid var(--line);
+    background: var(--surface);
+    font: inherit;
+    font-size: 12.5px;
+    color: var(--ink-2);
+    cursor: pointer;
+  }
+  .act-btn.primary {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    font-weight: 600;
+  }
+  .act-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .note-title {
+    font-size: 28px;
+    font-weight: 600;
+    line-height: 1.15;
+    letter-spacing: -0.02em;
+    color: var(--ink);
+    margin: 0 0 12px;
+  }
+  .kind-badge {
+    display: inline-block;
+    font-size: 11px;
+    color: var(--muted);
+    background: var(--surface-alt);
+    border: 1px solid var(--line);
+    border-radius: var(--r-pill);
+    padding: 1px 8px;
+    margin-bottom: 12px;
+  }
+  .source-link {
+    font-size: 12px;
+    color: var(--muted);
+    background: var(--surface-alt);
+    border: 1px solid var(--line);
+    border-radius: var(--r-md);
+    padding: 8px 11px;
+    margin-bottom: 14px;
+  }
+  .title-input {
+    width: 100%;
+    border: none;
+    outline: none;
+    background: transparent;
+    font-family: var(--ui);
+    font-size: 28px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    color: var(--ink);
+    margin-bottom: 12px;
+  }
+  .edit-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+  .tpl-select,
+  .folder-input {
+    height: 30px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-sm);
+    background: var(--surface-alt);
+    color: var(--ink-2);
+    font: inherit;
+    font-size: 12.5px;
+    padding: 0 8px;
+  }
+  .md-tag {
+    font-size: 11.5px;
+    color: var(--faint);
+    margin-left: auto;
+  }
+  .body-wrap {
+    position: relative;
+  }
+  .body-input {
+    width: 100%;
+    min-height: 380px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-lg);
+    background: var(--surface);
+    color: var(--ink-2);
+    padding: 16px 18px;
+    font-family: var(--mono);
+    font-size: 14px;
+    line-height: 1.65;
+    resize: vertical;
+    outline: none;
+  }
+  .wl-menu {
+    position: absolute;
+    left: 18px;
+    top: 40px;
+    z-index: 20;
+    list-style: none;
+    margin: 0;
+    padding: 4px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--r-md);
+    box-shadow: var(--shadow-md);
+    max-height: 220px;
+    overflow: auto;
+    min-width: 240px;
+  }
+  .wl-item {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    width: 100%;
+    border: none;
+    background: none;
+    font: inherit;
+    font-size: 13px;
+    padding: 6px 8px;
+    border-radius: var(--r-sm);
+    cursor: pointer;
+    text-align: left;
+    color: var(--ink);
+  }
+  .edit-foot {
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--faint);
+  }
+
+  /* prose (rendered markdown via @html) */
+  .prose {
+    font-size: 15.5px;
+    line-height: 1.62;
+    color: var(--ink-2);
+  }
+  .prose mark {
+    background: var(--mark);
+    color: var(--mark-ink);
+    border-radius: 4px;
+    padding: 1px 4px;
+  }
+  .prose :global(h1) {
+    font-size: 22px;
+    font-weight: 600;
+    color: var(--ink);
+    margin: 0 0 12px;
+  }
+  .prose :global(h2) {
+    font-size: 16.5px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: var(--ink);
+    margin: 26px 0 12px;
+  }
+  .prose :global(h3) {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--ink);
+    margin: 20px 0 10px;
+  }
+  .prose :global(p) {
+    margin: 0 0 14px;
+  }
+  .prose :global(ul),
+  .prose :global(ol) {
+    margin: 0 0 14px;
+    padding-left: 22px;
+  }
+  .prose :global(li) {
+    margin-bottom: 8px;
+  }
+  .prose :global(strong) {
+    font-weight: 600;
+    color: var(--ink);
+  }
+  .prose :global(a) {
+    color: var(--accent);
+    text-decoration: none;
+    border-bottom: 1px solid var(--accent-rim);
+    cursor: pointer;
+  }
+  .prose :global(code) {
+    font-family: var(--mono);
+    font-size: 0.88em;
+    background: var(--surface-alt);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 1px 5px;
+  }
+  .prose :global(mark) {
+    background: var(--mark);
+    color: var(--mark-ink);
+    border-radius: 4px;
+    padding: 1px 4px;
+  }
+  .prose :global(sup) {
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--accent);
+    background: var(--accent-soft);
+    border-radius: 4px;
+    padding: 1px 4px;
+  }
+  .prose :global(table) {
+    border-collapse: collapse;
+    font-size: 13.5px;
+    margin: 0 0 14px;
+  }
+  .prose :global(td),
+  .prose :global(th) {
+    border: 1px solid var(--line);
+    padding: 5px 9px;
+  }
+
+  .mentions {
+    margin-top: 34px;
+    padding-top: 16px;
+    border-top: 1px solid var(--line);
+  }
+  .mention {
+    display: flex;
+    gap: 12px;
+    align-items: baseline;
+    width: 100%;
+    padding: 9px 12px;
+    border-radius: var(--r-md);
+    background: var(--surface-alt);
+    border: 1px solid var(--line);
+    margin-top: 8px;
+    cursor: pointer;
+    text-align: left;
+  }
+  .mention .mono {
+    font-size: 12px;
+    color: var(--accent-ink);
+    flex: 0 0 auto;
+  }
+  .mention-pv {
+    font-size: 12.5px;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* empty */
+  .center-empty {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    padding: 60px 20px;
+    text-align: center;
+    color: var(--muted);
+  }
+  .empty-ic {
+    color: var(--faint);
+  }
+  .empty-cta {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .ghost-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 14px;
+    border-radius: var(--r-md);
+    border: 1px solid var(--line);
+    background: var(--surface);
+    color: var(--ink-2);
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+  }
+
+  /* graph lens */
+  .lens-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 16px 28px;
+    border-bottom: 1px solid var(--line);
+    flex: 0 0 auto;
+  }
+  .lens-ic.accent {
+    color: var(--accent);
+  }
+  .lens-title {
+    font-size: 16px;
+    font-weight: 600;
+  }
+  .lens-sub {
+    font-size: 12.5px;
+    color: var(--muted);
+  }
+  .lens-body {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+  }
+  .lens-canvas {
+    flex: 1;
+    min-height: 420px;
+    position: relative;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 16px;
+  }
+  .entity-graph {
+    width: 100%;
+    max-width: 920px;
+    touch-action: none;
+    cursor: grab;
+  }
+  .entity-graph.grabbing {
+    cursor: grabbing;
+  }
+  .g-node {
+    cursor: pointer;
+  }
+  .g-node.center {
+    cursor: default;
+  }
+  .node-label {
+    font-family: var(--ui);
+    font-size: 12px;
+    font-weight: 500;
+    fill: var(--ink);
+    pointer-events: none;
+  }
+  .g-node.center .node-label {
+    font-size: 14px;
+    font-weight: 600;
+  }
+  .edge-label {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    fill: var(--muted);
+  }
+  .lens-hint {
+    position: absolute;
+    left: 20px;
+    bottom: 16px;
+    font-size: 12px;
+    color: var(--faint);
+  }
+  .lens-mentions {
+    padding: 14px 28px 28px;
+    border-top: 1px solid var(--line);
+  }
+  .mention-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 8px;
+    margin-top: 10px;
+  }
+  .mention-grid .mention {
+    margin-top: 0;
+  }
+  .mention-nm {
+    flex: 1;
+    min-width: 0;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--ink-2);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .mention-go {
+    color: var(--faint);
+  }
+
+  /* ask rail */
+  .rail {
+    background: var(--rail);
+    border-left: 1px solid var(--line);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .rail-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 15px 16px 12px;
+  }
+  .rail-title {
+    font-weight: 600;
+    font-size: 15px;
+  }
+  .rail-scope {
+    font-size: 11.5px;
+    color: var(--muted);
+  }
+  .rail-scope .mono {
+    font-size: 11.5px;
+  }
+  .rail-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0 16px 8px;
+  }
+  .rail-idle {
+    font-size: 13.5px;
+    line-height: 1.6;
+    color: var(--muted);
+    margin: 8px 0 16px;
+  }
+  .try-list {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    margin-top: 8px;
+  }
+  .try {
+    text-align: left;
+    padding: 10px 12px;
+    border-radius: var(--r-md);
+    border: 1px solid var(--line);
+    background: var(--surface);
+    color: var(--ink-2);
+    font: inherit;
+    font-size: 13px;
+    line-height: 1.45;
+    cursor: pointer;
+  }
+  .ask-bubble {
+    max-width: 94%;
+    margin: 4px 0 14px auto;
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+    font-size: 13.5px;
+    line-height: 1.5;
+    padding: 9px 12px;
+    border-radius: 10px 10px 4px 10px;
+  }
+  .rail-loading {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--muted);
+    padding: 6px 0 14px;
+  }
+  .prose.answer {
+    font-size: 14px;
+    margin-bottom: 14px;
+  }
+  .prose.answer :global(p) {
+    margin: 0 0 10px;
+  }
+  .used-strip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 11px;
+    border-radius: var(--r-md);
+    background: var(--ok-soft);
+    margin-bottom: 14px;
+    font-size: 12px;
+  }
+  .us-ok {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: var(--ok);
+    font-weight: 600;
+  }
+  .us-div {
+    width: 1px;
+    height: 12px;
+    background: var(--line-strong);
+  }
+  .us-graph {
+    color: var(--ink-2);
+  }
+  .src-list {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    margin: 7px 0 0;
+  }
+  .src-row {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    width: 100%;
+    padding: 6px 8px;
+    border-radius: var(--r-sm);
+    border: none;
+    background: transparent;
+    text-align: left;
+    cursor: pointer;
+  }
+  .src-row.used {
+    background: var(--ok-soft);
+  }
+  .src-n {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--accent);
+    width: 20px;
+    flex: 0 0 20px;
+  }
+  .src-path {
+    font-size: 11.5px;
+    color: var(--ink-2);
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .src-graph {
+    font-size: 10.5px;
+    color: var(--accent-ink);
+    background: var(--accent-soft);
+    padding: 2px 6px;
+    border-radius: var(--r-pill);
+    flex: 0 0 auto;
+  }
+  .src-why {
+    font-size: 10.5px;
+    color: var(--muted);
+    flex: 0 0 auto;
+  }
+  .src-score {
+    font-size: 10.5px;
+    color: var(--faint);
+    width: 30px;
+    text-align: right;
+    flex: 0 0 30px;
+  }
+  .micromap {
+    margin-top: 14px;
+    padding: 10px 12px 6px;
+    border-radius: var(--r-md);
+    background: var(--surface-alt);
+    border: 1px solid var(--line);
+  }
+  .mm-label {
+    font-family: var(--mono);
+    font-size: 9.5px;
+    fill: var(--muted);
+  }
+  .compile-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    width: 100%;
+    height: 42px;
+    border-radius: var(--r-md);
+    border: none;
+    background: var(--accent);
+    color: #fff;
+    font: inherit;
+    font-size: 13.5px;
+    font-weight: 600;
+    margin: 14px 0 4px;
+    cursor: pointer;
+  }
+
+  /* composer */
+  .composer {
+    padding: 10px 16px 14px;
+    border-top: 1px solid var(--line);
+    background: var(--rail);
+    flex: 0 0 auto;
+  }
+  .composer-box {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+    padding: 8px 8px 8px 12px;
+    border-radius: var(--r-lg);
+    border: 1px solid var(--line);
+    background: var(--surface);
+  }
+  .composer-box textarea {
+    flex: 1;
+    border: none;
+    outline: none;
+    resize: none;
+    background: transparent;
+    color: var(--ink);
+    font-family: var(--ui);
+    font-size: 13.5px;
+    line-height: 1.5;
+    max-height: 90px;
+  }
+  .send {
+    width: 32px;
+    height: 32px;
+    flex: 0 0 32px;
+    display: grid;
+    place-items: center;
+    border-radius: var(--r-md);
+    border: none;
+    background: var(--line);
+    color: var(--muted);
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  .send.on {
+    background: var(--accent);
+    color: #fff;
+  }
+  .composer-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 8px;
+  }
+  .mode-chips {
+    display: flex;
+    gap: 6px;
+  }
+  .mchip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11.5px;
+    color: var(--muted);
+    padding: 3px 9px;
+    border-radius: var(--r-pill);
+    border: 1px solid var(--line);
+    background: transparent;
+    cursor: pointer;
+  }
+  .mchip.on {
+    color: var(--accent-ink);
+    background: var(--accent-soft);
+    border-color: transparent;
+  }
+
   .hidden-input {
     display: none;
   }
-  .source-link {
-    font-size: 0.76rem;
-    color: #6750a4;
-    background: #f5f2fd;
-    border: 1px solid #e7e0f8;
-    border-radius: 7px;
-    padding: 0.3rem 0.5rem;
-    margin-bottom: 0.6rem;
-  }
-  .badge {
-    font-size: 0.64rem;
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
-    background: #efeaf8;
-    color: #6750a4;
-    border-radius: 5px;
-    padding: 0 5px;
-    margin-left: 4px;
-  }
-  .divider {
-    width: 6px;
-    padding: 0;
-    border: 0;
-    cursor: col-resize;
-    background: #e4e4ea;
-    flex: 0 0 auto;
-  }
-  .divider.dragging,
-  .divider:hover {
-    background: #c9c2e6;
-  }
-  .divider:focus-visible {
-    outline: 2px solid #6750a4;
-  }
-  .block-h {
-    font-size: 0.72rem;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: #9a9aa2;
-    margin-bottom: 0.3rem;
+
+  /* overlays */
+  .overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    background: rgba(10, 12, 16, 0.32);
     display: flex;
+  }
+  .overlay.center-top {
+    justify-content: center;
+    padding-top: 12vh;
+  }
+  .overlay.center {
     align-items: center;
-    gap: 0.5rem;
-    flex-wrap: wrap; /* in the narrower doc panel, let note-action buttons wrap instead of clipping */
+    justify-content: center;
   }
-  .back {
-    margin-left: auto;
-    font: inherit;
-    font-size: 0.7rem;
-    cursor: pointer;
-    border: 0;
-    background: #f0f0f4;
-    border-radius: 6px;
-    padding: 0.1rem 0.4rem;
-    color: #6a6a72;
+  .overlay.to-right {
+    justify-content: flex-end;
   }
-  .doc {
-    font-size: 0.9rem;
-    line-height: 1.6;
-    white-space: pre-wrap;
-    color: #2a2a30;
+  .popover {
+    position: fixed;
+    z-index: 70;
+    max-width: 280px;
+    background: var(--ink);
+    color: var(--bg);
+    font-size: 12px;
+    line-height: 1.4;
+    padding: 8px 10px;
+    border-radius: var(--r-sm);
+    box-shadow: var(--shadow-lg);
+    pointer-events: none;
   }
-  mark {
-    background: #fff3a3;
-    border-radius: 3px;
-    padding: 0 2px;
-  }
-  .doc.rendered {
-    white-space: normal;
-  }
-  .doc.rendered :global(h1),
-  .doc.rendered :global(h2),
-  .doc.rendered :global(h3) {
-    line-height: 1.25;
-    margin: 0.8rem 0 0.4rem;
-  }
-  .doc.rendered :global(h1) {
-    font-size: 1.4rem;
-  }
-  .doc.rendered :global(h2) {
-    font-size: 1.2rem;
-  }
-  .doc.rendered :global(h3) {
-    font-size: 1.05rem;
-  }
-  .doc.rendered :global(p) {
-    margin: 0.5rem 0;
-  }
-  .doc.rendered :global(ul),
-  .doc.rendered :global(ol) {
-    margin: 0.4rem 0;
-    padding-left: 1.4rem;
-  }
-  .doc.rendered :global(li) {
-    margin: 0.15rem 0;
-  }
-  .doc.rendered :global(code) {
-    background: #f2f2f6;
-    border-radius: 4px;
-    padding: 0 4px;
-    font-size: 0.86em;
-  }
-  .doc.rendered :global(pre) {
-    background: #1c1c22;
-    color: #f3f3f6;
-    border-radius: 8px;
-    padding: 0.7rem 0.85rem;
-    overflow: auto;
-  }
-  .doc.rendered :global(pre code) {
-    background: none;
-    color: inherit;
-    padding: 0;
-  }
-  .doc.rendered :global(blockquote) {
-    margin: 0.5rem 0;
-    padding: 0.1rem 0.8rem;
-    border-left: 3px solid #d9cef2;
-    color: #5a5a62;
-  }
-  .doc.rendered :global(hr) {
-    border: 0;
-    border-top: 1px solid #e4e4ea;
-    margin: 0.9rem 0;
-  }
-  .doc.rendered :global(table) {
-    border-collapse: collapse;
-    margin: 0.5rem 0;
-    font-size: 0.85rem;
-  }
-  .doc.rendered :global(th),
-  .doc.rendered :global(td) {
-    border: 1px solid #e4e4ea;
-    padding: 0.3rem 0.55rem;
-    text-align: left;
-  }
-  .doc.rendered :global(th) {
-    background: #f6f4fc;
-  }
-  .doc.rendered :global(a.wikilink) {
-    color: #6750a4;
-    text-decoration: underline dotted;
-    cursor: pointer;
-  }
-  .doc.rendered :global(a) {
-    color: #6750a4;
-  }
-  .doc.rendered :global(.broken-link) {
-    color: #b00020;
-    text-decoration: underline dotted;
-  }
-  .doc.rendered :global(input[type='checkbox']) {
-    margin-right: 0.3rem;
-  }
-  .editor-preview {
-    border: 1px solid #ececf2;
-    border-radius: 8px;
-    padding: 0.4rem 0.7rem;
-    background: #fcfcfe;
-    max-height: 40vh;
-    overflow: auto;
-  }
-  .controls {
-    margin-bottom: 0.5rem;
-    display: flex;
-    gap: 0.4rem;
-    flex-wrap: wrap;
-  }
-  .scope-select {
-    border: 1px solid #d8d8e0;
-    border-radius: 8px;
-    padding: 0.3rem 0.4rem;
-    font-size: 0.8rem;
-    color: #6750a4;
-    background: #fff;
-    cursor: pointer;
-    max-width: 100%;
-  }
-  .mode-toggle {
-    display: inline-flex;
-    border: 1px solid #d8d8e0;
-    border-radius: 8px;
+
+  .switcher {
+    width: 600px;
+    max-width: 92vw;
+    max-height: 460px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--r-xl);
+    box-shadow: var(--shadow-lg);
     overflow: hidden;
-  }
-  .mode-btn {
-    font: inherit;
-    font-size: 0.78rem;
-    border: 0;
-    background: #fff;
-    color: #6a6a72;
-    padding: 0.3rem 0.55rem;
-    cursor: pointer;
-  }
-  .mode-btn.on {
-    background: #efeaf8;
-    color: #6750a4;
-    font-weight: 600;
-  }
-  .mode-btn:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
-  .gpu-bar {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    flex-wrap: wrap;
-    margin-bottom: 0.5rem;
-    font-size: 0.74rem;
-    color: #5a5a64;
-  }
-  .gpu-bar.warn {
-    color: #8a5a00;
-    background: #fff4e0;
-    border-radius: 8px;
-    padding: 0.35rem 0.55rem;
-  }
-  .gpu-bar .ok {
-    color: #1a7f37;
-  }
-  .loading-model {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.35rem;
-    color: #6750a4;
-    font-weight: 600;
-  }
-  .loading-model small {
-    color: #8a8a92;
-    font-weight: 400;
-  }
-  .progress {
-    flex: 1 1 8rem;
-    min-width: 6rem;
-    height: 6px;
-    background: #e8e4f4;
-    border-radius: 999px;
-    overflow: hidden;
-  }
-  .progress-fill {
-    display: block;
-    height: 100%;
-    background: #6750a4;
-    border-radius: 999px;
-    transition: width 0.2s ease;
-  }
-  .mini {
-    font: inherit;
-    font-size: 0.72rem;
-    cursor: pointer;
-    border: 1px solid #d8d8e0;
-    background: #fff;
-    border-radius: 6px;
-    padding: 0.12rem 0.5rem;
-    color: #444;
-  }
-  .mini.accent {
-    color: #6750a4;
-    background: #efeaf8;
-    border-color: #d9cffa;
-    font-weight: 600;
-  }
-  .mini:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
-  .ask-row {
-    display: flex;
-    gap: 0.5rem;
-    align-items: center;
-    flex-wrap: wrap;
-  }
-  .compile-ctx {
-    margin-top: 0.7rem;
-  }
-  .compiler {
-    width: min(720px, 94vw);
-    background: #fff;
-    border-radius: 12px;
-    box-shadow: 0 12px 48px #0004;
-    padding: 0.9rem 1rem;
     display: flex;
     flex-direction: column;
-    gap: 0.6rem;
   }
-  .compiler-head {
+  .sw-input {
     display: flex;
     align-items: center;
-    gap: 0.6rem;
+    gap: 11px;
+    padding: 0 16px;
+    height: 54px;
+    border-bottom: 1px solid var(--line);
   }
-  .compiler-sub {
-    font-size: 0.76rem;
-    color: #8a8a90;
-  }
-  .compiler-head .back {
-    margin-left: auto;
-  }
-  .compiler-controls {
-    display: flex;
-    gap: 0.8rem;
-    flex-wrap: wrap;
-    font-size: 0.76rem;
-    color: #6a6a72;
-  }
-  .compiler-controls label {
-    display: flex;
-    flex-direction: column;
-    gap: 0.2rem;
-  }
-  .compiler-controls .redact {
+  .sw-input input {
     flex: 1;
-    min-width: 180px;
+    border: none;
+    outline: none;
+    background: transparent;
+    font-size: 15.5px;
+    color: var(--ink);
+    font-family: var(--ui);
   }
-  .compiler-controls select,
-  .compiler-controls input {
-    border: 1px solid #d8d8e0;
-    border-radius: 7px;
-    padding: 0.3rem 0.45rem;
-    font: inherit;
-    font-size: 0.82rem;
+  .sw-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px;
+    margin: 0;
+    list-style: none;
   }
-  .compiler-meta {
-    font-size: 0.78rem;
-    color: #5a5a62;
-  }
-  .consent {
-    color: #9a5a00;
-  }
-  .compiler-xml {
-    width: 100%;
-    box-sizing: border-box;
-    border: 1px solid #e4e4ea;
-    border-radius: 8px;
-    padding: 0.5rem;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 0.76rem;
-    line-height: 1.45;
-    background: #fbfbfd;
-    resize: vertical;
-  }
-  .compiler-actions {
+  .sw-ask,
+  .sw-item {
     display: flex;
-    gap: 0.5rem;
     align-items: center;
+    gap: 11px;
+    width: 100%;
+    border: none;
+    border-radius: var(--r-md);
+    text-align: left;
+    cursor: pointer;
+    font: inherit;
   }
-  /* Context-Engine panel additions (CE1/CE2/CE3/CE4/CE5). */
-  .task-input {
+  .sw-ask {
+    padding: 11px 12px;
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+    font-size: 14px;
+    margin-bottom: 6px;
+  }
+  .sw-ask span {
+    flex: 1;
+  }
+  .sw-item {
+    padding: 9px 12px;
+    background: transparent;
+    color: var(--ink);
+    font-size: 14px;
+  }
+  .sw-item .mono {
+    margin-left: auto;
+    font-size: 11.5px;
+    color: var(--faint);
+  }
+  .sw-empty {
+    padding: 20px;
+    text-align: center;
+    color: var(--muted);
+    font-size: 13px;
+  }
+
+  /* compiler side-sheet */
+  .sheet {
+    width: 460px;
+    max-width: 94vw;
+    height: 100%;
+    background: var(--surface);
+    border-left: 1px solid var(--line);
+    box-shadow: var(--shadow-lg);
     display: flex;
     flex-direction: column;
-    gap: 0.2rem;
-    font-size: 0.72rem;
-    color: #5a5a62;
-    margin-top: 0.4rem;
   }
-  .task-input input {
-    border: 1px solid #e4e4ea;
-    border-radius: 6px;
-    padding: 0.3rem 0.45rem;
+  .sheet-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 16px 20px 14px;
+    border-bottom: 1px solid var(--line);
+  }
+  .sheet-head .accent {
+    color: var(--accent);
+    display: inline-flex;
+  }
+  .sheet-head strong {
+    font-size: 16px;
+  }
+  .sheet-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 18px 20px 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 22px;
+  }
+  .step {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .step-h {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--ink);
+  }
+  .step-n {
+    width: 22px;
+    height: 22px;
+    border-radius: 999px;
+    background: var(--accent);
+    color: #fff;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .field {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .field input,
+  .field select {
+    height: 34px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-md);
+    background: var(--surface-alt);
+    color: var(--ink-2);
     font: inherit;
+    font-size: 13px;
+    padding: 0 10px;
   }
   .pii-row {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 0.4rem 0.6rem;
-    font-size: 0.72rem;
-    color: #5a5a62;
-    margin-top: 0.4rem;
+    gap: 7px;
   }
   .pii-chip {
     display: inline-flex;
     align-items: center;
-    gap: 0.2rem;
+    gap: 5px;
+    font-size: 12px;
+    color: var(--muted);
+    padding: 4px 9px;
+    border-radius: var(--r-pill);
+    border: 1px solid var(--line);
+    cursor: pointer;
   }
-  .redact-preview {
+  .pii-chip.on {
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+    border-color: transparent;
+  }
+  .pii-chip input {
+    accent-color: var(--accent);
+  }
+  .pii-row select {
+    height: 30px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-sm);
+    background: var(--surface-alt);
+    color: var(--ink-2);
+    font: inherit;
+    font-size: 12.5px;
+    padding: 0 6px;
+  }
+  .remove-box {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 0.35rem;
-    font-size: 0.72rem;
-    color: #9a5a00;
-    margin-top: 0.4rem;
+    gap: 6px;
+    padding: 9px 11px;
+    border-radius: var(--r-md);
+    background: var(--warn-soft);
+    color: var(--warn);
+    font-size: 12px;
   }
-  .redact-pill {
-    background: #fff3e0;
-    border: 1px solid #f0d8b0;
-    border-radius: 999px;
-    padding: 0.05rem 0.45rem;
-  }
-  .cost-line {
-    font-size: 0.78rem;
-    color: #1a7f37;
-    margin: 0.2rem 0;
-  }
-  .cost-line.over {
-    color: #b00020;
+  .remove-pill {
+    background: rgba(176, 106, 18, 0.14);
+    border-radius: var(--r-pill);
+    padding: 1px 8px;
     font-weight: 600;
   }
-  .audit-count {
-    font-size: 0.72rem;
-    color: #6750a4;
+  .stat-row {
+    display: flex;
+    gap: 10px;
   }
-  .paste-back {
-    margin-top: 0.5rem;
-    font-size: 0.78rem;
+  .stat {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 10px 12px;
+    border-radius: var(--r-md);
+    border: 1px solid var(--line);
+    background: var(--surface-alt);
+  }
+  .stat strong {
+    font-size: 18px;
+  }
+  .stat strong.over {
+    color: var(--warn);
+  }
+  .payload {
+    width: 100%;
+    border: 1px solid var(--line);
+    border-radius: var(--r-md);
+    background: var(--surface-alt);
+    color: var(--ink-2);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    line-height: 1.6;
+    padding: 10px 12px;
+    resize: vertical;
+    outline: none;
+  }
+  .sheet-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
   }
   .paste-back summary {
+    font-size: 12.5px;
+    color: var(--accent);
     cursor: pointer;
-    color: #6750a4;
   }
   .paste-back textarea {
     width: 100%;
-    box-sizing: border-box;
-    margin-top: 0.4rem;
-    border: 1px solid #e4e4ea;
-    border-radius: 8px;
-    padding: 0.45rem;
-    font: inherit;
+    margin-top: 8px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-md);
+    background: var(--surface-alt);
+    color: var(--ink-2);
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 8px 10px;
     resize: vertical;
+    outline: none;
   }
   .paste-refs {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.35rem;
-    margin-top: 0.4rem;
+    gap: 6px;
+    margin-top: 8px;
   }
   .paste-ref {
-    border: 1px solid #d9d2f0;
-    background: #f6f3ff;
-    color: #4a3f86;
-    border-radius: 6px;
-    padding: 0.1rem 0.4rem;
-    font-size: 0.72rem;
+    font-size: 11.5px;
+    border: 1px solid var(--line);
+    background: var(--surface);
+    border-radius: var(--r-sm);
+    padding: 3px 8px;
     cursor: pointer;
+    color: var(--accent-ink);
   }
   .paste-ref.broken {
-    background: #fbe9e9;
-    border-color: #f0c0c0;
-    color: #8a1f1f;
+    color: var(--muted);
     cursor: default;
   }
-  select,
-  textarea,
-  button {
-    font: inherit;
-  }
-  textarea {
-    width: 100%;
-    box-sizing: border-box;
-    border: 1px solid #d8d8e0;
-    border-radius: 8px;
-    padding: 0.5rem;
-    resize: vertical;
-  }
-  .ask {
-    margin-top: 0.5rem;
-    cursor: pointer;
-    background: #6750a4;
-    color: #fff;
-    border: 0;
-    border-radius: 8px;
-    padding: 0.5rem 1rem;
-  }
-  .ask:disabled {
-    opacity: 0.5;
-  }
-  .spinner {
-    display: inline-block;
-    width: 0.8rem;
-    height: 0.8rem;
-    border: 2px solid #d9cef2;
-    border-top-color: #6750a4;
-    border-radius: 50%;
-    animation: spin 0.7s linear infinite;
-    vertical-align: -1px;
-    margin-right: 0.35rem;
-  }
-  @keyframes spin {
-    to {
-      transform: rotate(360deg);
-    }
-  }
-  .loading-banner {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    margin-top: 0.8rem;
-    padding: 0.6rem 0.7rem;
-    background: #f5f2fd;
-    border: 1px solid #e7e0f8;
-    border-radius: 10px;
-    font-size: 0.82rem;
-    color: #5a4a86;
-  }
-  .loading-banner small {
-    color: #8a7fb0;
-  }
-  .sources,
-  .micromap,
-  .answer {
-    margin-top: 1rem;
-  }
-  .src {
-    display: block;
-    width: 100%;
-    text-align: left;
-    cursor: pointer;
-    background: #fff;
-    border: 1px solid #e8e8ee;
-    border-radius: 8px;
-    padding: 0.35rem 0.5rem;
-    margin-bottom: 0.3rem;
-    font-size: 0.8rem;
-  }
-  .src:hover {
-    border-color: #6750a4;
-  }
-  .src-n {
-    color: #6750a4;
-    font-weight: 600;
-  }
-  .score {
-    float: right;
-    color: #9a9aa2;
-  }
-  .used-tag {
-    color: #1a7f37;
-    font-weight: 600;
-    font-size: 0.72rem;
-    margin-left: 0.35rem;
-  }
-  .used-badge {
-    color: #1a7f37;
-    font-weight: 600;
-    font-size: 0.72rem;
-    margin-left: 0.4rem;
-  }
-  .src.used {
-    border-color: #bfe3c8;
-    background: #f6fcf8;
-  }
-  .graph {
-    background: #fff;
-    border: 1px solid #e8e8ee;
-    border-radius: 10px;
-  }
-  .g-label {
-    font-size: 9px;
-    fill: #6a6a72;
-  }
-  .answer {
-    background: #fff;
-    border: 1px solid #e8e8ee;
-    border-radius: 12px;
-    padding: 0.8rem 0.9rem;
-  }
-  /* Rendered-Markdown answer (FR-CHAT-001). Content is {@html}, so inner tags need :global. */
-  .answer-body {
-    line-height: 1.55;
-  }
-  .answer-body :global(p) {
-    margin: 0.5rem 0;
-  }
-  .answer-body :global(p:first-child) {
-    margin-top: 0;
-  }
-  .answer-body :global(ul),
-  .answer-body :global(ol) {
-    margin: 0.4rem 0;
-    padding-left: 1.4rem;
-  }
-  .answer-body :global(li) {
-    margin: 0.15rem 0;
-  }
-  .answer-body :global(h1),
-  .answer-body :global(h2),
-  .answer-body :global(h3) {
-    margin: 0.7rem 0 0.3rem;
-    font-size: 1.02rem;
-  }
-  .answer-body :global(code) {
-    background: #f3f1fa;
-    border-radius: 4px;
-    padding: 0.05rem 0.3rem;
-    font-size: 0.92em;
-  }
-  .answer-body :global(pre) {
-    background: #f3f1fa;
-    border-radius: 8px;
-    padding: 0.6rem 0.7rem;
-    overflow-x: auto;
-  }
-  .answer-body :global(pre code) {
-    background: none;
-    padding: 0;
-  }
-  .answer-body :global(.cite),
-  .answer-body :global(.wikilink) {
-    cursor: pointer;
-    border: 0;
-    background: none;
-    padding: 0;
-    color: #6750a4;
-    font: inherit;
-    text-decoration: underline dotted;
-  }
-  .answer-body :global(.cite) {
-    font-size: 0.85em;
-    vertical-align: super;
-    line-height: 0;
-  }
-  .references {
-    margin-top: 0.8rem;
-    border-top: 1px solid #ececf2;
-    padding-top: 0.55rem;
-  }
-  .reference {
-    display: flex;
-    align-items: baseline;
-    gap: 0.4rem;
-    width: 100%;
-    text-align: left;
-    cursor: pointer;
-    background: none;
-    border: 0;
-    border-radius: 6px;
-    padding: 0.25rem 0.4rem;
-  }
-  .reference:hover {
-    background: #efeaf8;
-  }
-  .ref-n {
-    color: #6750a4;
-    font-weight: 600;
-    font-size: 0.8rem;
-  }
-  .reference.cited .ref-n::after {
-    content: ' •';
-    color: #1a7f37;
-  }
-  .ref-title {
-    font-size: 0.82rem;
-    color: #2a2a30;
-    font-weight: 600;
-  }
-  .ref-doc {
-    font-size: 0.72rem;
-    color: #9a9aa2;
-    margin-left: auto;
-    white-space: nowrap;
-  }
-  .modes {
-    display: flex;
-    gap: 0.3rem;
-    margin-bottom: 0.7rem;
-  }
-  .modetab {
-    cursor: pointer;
-    font-size: 0.78rem;
-    border: 1px solid #e0e0e8;
-    background: #fff;
-    color: #6a6a72;
-    border-radius: 7px;
-    padding: 0.25rem 0.7rem;
-  }
-  .modetab.active {
-    background: #efeaf8;
-    color: #6750a4;
-    border-color: #d9cef2;
-    font-weight: 600;
-  }
-  .modetab.primary {
-    border-color: #d9cef2;
-    color: #6750a4;
-    font-weight: 600;
-  }
-  .modetab.primary.active {
-    background: #6750a4;
-    color: #fff;
-    border-color: #6750a4;
-  }
-  .editor {
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-  }
-  .editor-top {
-    display: flex;
-    gap: 0.4rem;
-  }
-  .title-input {
-    flex: 1;
-    min-width: 0;
-    box-sizing: border-box;
-    border: 1px solid #d8d8e0;
-    border-radius: 8px;
-    padding: 0.5rem 0.6rem;
-    font-size: 1rem;
-    font-weight: 600;
-  }
-  .folder-input {
-    width: 9rem;
-    box-sizing: border-box;
-    border: 1px solid #d8d8e0;
-    border-radius: 8px;
-    padding: 0.5rem 0.6rem;
-    font-size: 0.82rem;
-    color: #555;
-  }
-  .tpl-select {
-    border: 1px solid #d8d8e0;
-    border-radius: 8px;
-    padding: 0 0.4rem;
-    font-size: 0.78rem;
-    color: #6750a4;
-    background: #fff;
-    cursor: pointer;
-  }
-  .body-input {
-    width: 100%;
-    box-sizing: border-box;
-    border: 1px solid #d8d8e0;
-    border-radius: 8px;
-    padding: 0.6rem;
-    resize: vertical;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 0.86rem;
-    line-height: 1.5;
-  }
-  .editor-actions {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    flex-wrap: wrap;
-  }
-  .ghost {
-    cursor: pointer;
-    font-size: 0.8rem;
-    background: #f0f0f4;
-    color: #6a6a72;
-    border: 0;
-    border-radius: 8px;
-    padding: 0.5rem 0.8rem;
-  }
-  .editmsg {
-    font-size: 0.76rem;
-    color: #1a7f37;
-  }
-  .editor-hint {
-    margin: 0.2rem 0 0;
-    font-size: 0.74rem;
-    color: #9a9aa2;
-    line-height: 1.4;
-  }
-  .editor-hint code {
-    background: #f2f2f6;
-    border-radius: 4px;
-    padding: 0 4px;
-  }
-  .newnote {
-    background: #efeaf8;
-    color: #6750a4;
-    border: 1px solid #d9cef2;
-  }
-  .note-actions {
-    margin-left: auto;
-    display: inline-flex;
-    flex-wrap: wrap;
-    gap: 0.4rem;
-  }
-  .note-actions .back {
-    margin-left: 0;
-  }
-  .back.edit {
-    color: #6750a4;
-    background: #efeaf8;
-  }
-  .back.danger {
-    color: #b3261e;
-    background: #fce8e6;
-  }
-  .body-wrap {
-    position: relative;
-  }
-  .wl-menu {
-    position: absolute;
-    left: 0.6rem;
-    right: 0.6rem;
-    top: 100%;
-    margin: -0.3rem 0 0;
-    padding: 0.2rem;
-    list-style: none;
-    background: #fff;
-    border: 1px solid #d9cef2;
-    border-radius: 8px;
-    box-shadow: 0 6px 20px #0002;
-    z-index: 8;
-    max-height: 220px;
-    overflow: auto;
-  }
-  .wl-item,
-  .switcher-item {
-    display: flex;
-    flex-direction: column;
-    width: 100%;
-    text-align: left;
-    cursor: pointer;
-    border: 0;
-    background: none;
-    border-radius: 6px;
-    padding: 0.3rem 0.5rem;
-  }
-  .wl-item:hover,
-  .switcher-item:hover {
-    background: #efeaf8;
-  }
-  .wl-title {
-    font-size: 0.84rem;
-    font-weight: 600;
-    color: #2a2a30;
-  }
-  .wl-doc {
-    font-size: 0.7rem;
-    color: #9a9aa2;
-  }
-  .tagbar {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.3rem;
-    margin-bottom: 0.9rem;
-  }
-  .tagchip {
-    cursor: pointer;
-    font-size: 0.74rem;
-    background: #f3f1fa;
-    color: #6750a4;
-    border: 1px solid #e7e0f8;
-    border-radius: 999px;
-    padding: 0.1rem 0.55rem;
-  }
-  .tagchip.active {
-    background: #6750a4;
-    color: #fff;
-    border-color: #6750a4;
-  }
-  .tagcount {
-    opacity: 0.6;
-    font-size: 0.68rem;
-  }
-  .graph-badge {
-    font-size: 0.68rem;
-    color: #6750a4;
-    margin-left: 0.3rem;
-  }
-  .tree-folder,
-  .tree-file {
-    display: block;
-    width: 100%;
-    text-align: left;
-    cursor: pointer;
-    border: 0;
-    background: none;
-    border-radius: 6px;
-    padding: 0.22rem 0.4rem;
-    font-size: 0.82rem;
-    color: #2a2a30;
-  }
-  .tree-folder {
-    font-weight: 600;
-  }
-  .tree-folder:hover,
-  .tree-file:hover {
-    background: #efeaf8;
-  }
-  .tree-caret {
-    display: inline-block;
-    width: 0.9rem;
-    color: #9a9aa2;
-  }
-  .tree-children {
-    margin-left: 0.8rem;
-    border-left: 1px solid #ececf2;
-    padding-left: 0.3rem;
-  }
-  .links-panel {
-    margin-top: 1rem;
-    border-top: 1px solid #ececf2;
-    padding-top: 0.7rem;
-  }
-  .um-snippet {
-    display: block;
-    font-size: 0.74rem;
-    color: #8a8a90;
-    margin-top: 0.1rem;
-  }
-  .switcher-overlay {
-    position: fixed;
-    inset: 0;
-    background: #0006;
-    display: flex;
-    justify-content: center;
-    align-items: flex-start;
-    padding-top: 12vh;
-    z-index: 20;
-  }
-  .switcher {
-    width: min(560px, 92vw);
-    background: #fff;
-    border-radius: 12px;
-    box-shadow: 0 12px 48px #0004;
-    overflow: hidden;
-  }
-  .switcher-input {
-    width: 100%;
-    box-sizing: border-box;
-    border: 0;
-    border-bottom: 1px solid #ececf2;
-    padding: 0.8rem 1rem;
-    font-size: 1rem;
-    outline: none;
-  }
-  .switcher-list {
-    list-style: none;
-    margin: 0;
-    padding: 0.3rem;
-    max-height: 50vh;
-    overflow: auto;
-  }
-  .switcher-empty {
-    padding: 0.7rem 1rem;
-    color: #9a9aa2;
-    font-size: 0.84rem;
-  }
-  .popover {
-    position: fixed;
-    max-width: 280px;
-    background: #1c1c22;
-    color: #f3f3f6;
-    font-size: 0.76rem;
-    line-height: 1.4;
-    padding: 0.4rem 0.55rem;
-    border-radius: 8px;
-    pointer-events: none;
-    z-index: 10;
-    box-shadow: 0 4px 16px #0003;
-  }
 
-  /* --- Workspace: Files/Graph switch + folder-sidebar | doc/graph layout --- */
-  .viewswitch {
-    display: inline-flex;
-    border: 1px solid #d8d8e0;
-    border-radius: 8px;
-    overflow: hidden;
-    margin-right: 0.3rem;
-  }
-  .vbtn {
-    font-size: 0.78rem;
-    border: 0;
-    background: #fff;
-    color: #6a6a72;
-    padding: 0.25rem 0.6rem;
-    cursor: pointer;
-  }
-  .vbtn.on {
-    background: #6750a4;
-    color: #fff;
-    font-weight: 600;
-  }
-  .workspace {
-    display: flex;
-    gap: 0.7rem;
-    min-height: 0;
-    align-items: stretch;
-  }
-  .tree-aside {
-    flex: 0 0 14rem;
-    max-width: 16rem;
-    overflow: auto;
-    padding-right: 0.6rem;
-    border-right: 1px solid #ececf2;
-  }
-  .tree-aside.drop {
-    background: #faf8ff;
-    outline: 2px dashed #c9c2e6;
-    outline-offset: -4px;
-    border-radius: 8px;
-  }
-  .docpane,
-  .graphpane {
-    flex: 1 1 auto;
-    min-width: 0;
-    overflow: auto;
-  }
-  .empty-doc {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    text-align: center;
-    gap: 0.4rem;
-    color: #8a8a92;
-    height: 100%;
-    min-height: 14rem;
-    padding: 1rem;
-  }
-  .empty-emoji {
-    font-size: 2.4rem;
-    opacity: 0.55;
-  }
-  .empty-doc p {
-    margin: 0;
-    font-size: 0.86rem;
-    max-width: 26rem;
-  }
-  .empty-doc .hint {
-    font-size: 0.76rem;
-  }
-  .linklike {
-    border: 0;
-    background: none;
-    padding: 0;
-    color: #6750a4;
-    font: inherit;
-    text-decoration: underline;
-    cursor: pointer;
-  }
-  .tree-file.active {
-    background: #efeaf8;
-    color: #6750a4;
-    font-weight: 600;
-  }
-  .tree-file.dragging {
-    opacity: 0.5;
-  }
-  .tree-folder.drop {
-    background: #ece6fb;
-    outline: 2px dashed #6750a4;
-    outline-offset: -2px;
-  }
-  .tags-h {
-    margin-top: 0.9rem;
-  }
-
-  /* --- Graph view: entity list + node-link canvas --- */
-  .entity-search {
-    width: 100%;
-    box-sizing: border-box;
-    border: 1px solid #d8d8e0;
-    border-radius: 7px;
-    padding: 0.3rem 0.45rem;
-    font-size: 0.8rem;
-    margin-bottom: 0.4rem;
-  }
-  .entity-list {
-    display: flex;
-    flex-direction: column;
-    gap: 0.1rem;
-  }
-  .entity-item {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    width: 100%;
-    text-align: left;
-    cursor: pointer;
-    border: 0;
-    background: none;
-    border-radius: 6px;
-    padding: 0.25rem 0.4rem;
-    font-size: 0.82rem;
-    color: #2a2a30;
-  }
-  .entity-item:hover {
-    background: #efeaf8;
-  }
-  .entity-item.active {
-    background: #efeaf8;
-    color: #6750a4;
-    font-weight: 600;
-  }
-  .entity-name {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .dot {
-    flex: 0 0 auto;
-    width: 9px;
-    height: 9px;
-    border-radius: 50%;
-    display: inline-block;
-  }
-  .dot.lg {
-    width: 12px;
-    height: 12px;
-  }
-  .entity-graph {
-    width: 100%;
-    height: auto;
-    background: #fcfbff;
-    border: 1px solid #ececf2;
-    border-radius: 10px;
-    margin-bottom: 0.7rem;
-    cursor: grab;
-    touch-action: none; /* let pointer drag/pan work on touch instead of scrolling the page */
-  }
-  .entity-graph.grabbing {
-    cursor: grabbing;
-  }
-  .graph-hint {
-    font-size: 0.72rem;
-    color: #9a93b3;
-    margin: 0 0 0.3rem;
-  }
-  .g-node {
-    cursor: grab;
-  }
-  .g-node.center {
-    cursor: grab;
-  }
-  .g-node:focus-visible {
-    outline: none;
-  }
-  .g-node:focus-visible circle {
-    stroke: #1c1c22;
-    stroke-width: 3;
-  }
-  .node-label {
-    font-size: 12px;
-    fill: #2a2a30;
-    pointer-events: none;
-  }
-  .edge-label {
-    font-size: 10px;
-    fill: #79747e;
-    font-style: italic;
-    pointer-events: none;
-  }
-
-  /* --- File-tree context menu --- */
+  /* context menu */
   .ctx-backdrop {
     position: fixed;
     inset: 0;
-    z-index: 24;
+    z-index: 80;
   }
   .ctx-menu {
     position: fixed;
-    z-index: 25;
-    min-width: 9.5rem;
-    background: #fff;
-    border: 1px solid #e0dcec;
-    border-radius: 9px;
-    box-shadow: 0 10px 30px #0003;
-    padding: 0.25rem;
+    z-index: 81;
+    min-width: 168px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--r-md);
+    box-shadow: var(--shadow-lg);
+    padding: 5px;
     display: flex;
     flex-direction: column;
   }
   .ctx-item {
+    display: block;
+    width: 100%;
     text-align: left;
-    border: 0;
+    border: none;
     background: none;
-    border-radius: 6px;
-    padding: 0.35rem 0.55rem;
-    font-size: 0.8rem;
-    color: #2a2a30;
+    font: inherit;
+    font-size: 13px;
+    color: var(--ink-2);
+    padding: 7px 10px;
+    border-radius: var(--r-sm);
     cursor: pointer;
   }
-  .ctx-item:hover {
-    background: #efeaf8;
-  }
   .ctx-item.danger {
-    color: #b3261e;
-  }
-  .ctx-item.danger:hover {
-    background: #fce8e6;
+    color: var(--error, #b3261e);
   }
 
-  /* --- Startup model gate --- */
+  /* model gate */
   .gate {
-    width: min(560px, 94vw);
+    width: 460px;
+    max-width: 94vw;
     max-height: 86vh;
-    overflow: auto;
-    background: #fff;
-    border-radius: 14px;
-    box-shadow: 0 16px 56px #0005;
-    padding: 1.1rem 1.2rem;
+    overflow-y: auto;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--r-xl);
+    box-shadow: var(--shadow-lg);
+    padding: 22px;
     display: flex;
     flex-direction: column;
-    gap: 0.55rem;
+    gap: 12px;
   }
   .gate-head strong {
-    font-size: 1.05rem;
-    color: #6750a4;
+    font-size: 17px;
   }
-  .gate-sub {
-    margin: 0.3rem 0 0;
-    font-size: 0.84rem;
-    color: #5a5a64;
-    line-height: 1.45;
+  .gate-head p {
+    margin: 6px 0 0;
   }
   .gate-auto {
     display: flex;
     flex-direction: column;
-    gap: 0.1rem;
+    gap: 2px;
     align-items: flex-start;
-    text-align: left;
-    cursor: pointer;
-    border: 1px solid #d9cef2;
-    background: #6750a4;
-    color: #fff;
-    border-radius: 10px;
-    padding: 0.6rem 0.8rem;
-    font-size: 0.92rem;
+    padding: 12px 14px;
+    border-radius: var(--r-md);
+    border: 1.5px solid var(--accent);
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+    font: inherit;
     font-weight: 600;
-  }
-  .gate-auto small {
-    font-weight: 400;
-    opacity: 0.92;
-    font-size: 0.74rem;
-  }
-  .gate-or {
-    font-size: 0.74rem;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: #9a9aa2;
-    text-align: center;
-    margin: 0.1rem 0;
+    cursor: pointer;
   }
   .gate-list {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 0.4rem;
-  }
-  .gate-model {
-    display: flex;
-    align-items: stretch;
-    border: 1px solid #e4e0ee;
-    background: #fff;
-    border-radius: 9px;
-    overflow: hidden;
-  }
-  .gate-model:hover {
-    border-color: #6750a4;
-  }
-  .gate-model.current {
-    border-color: #6750a4;
-    background: #efeaf8;
-  }
-  .gate-model.cached {
-    border-color: #bfe3c8;
-  }
-  .gate-model-pick {
-    flex: 1;
-    min-width: 0;
     display: flex;
     flex-direction: column;
-    gap: 0.15rem;
-    align-items: flex-start;
-    text-align: left;
-    cursor: pointer;
-    border: 0;
-    background: none;
-    padding: 0.45rem 0.6rem;
+    gap: 4px;
   }
-  .gate-model-pick:hover {
-    background: #faf8ff;
-  }
-  .gate-model-pick:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
-  .gate-model-label {
-    font-size: 0.82rem;
-    font-weight: 600;
-    color: #2a2a30;
+  .gate-row {
     display: flex;
     align-items: center;
-    gap: 0.2rem;
+    gap: 6px;
   }
-  .gate-model-size {
-    font-size: 0.74rem;
-    color: #8a8a92;
+  .gate-row.current .gate-pick {
+    border-color: var(--accent);
   }
-  .cached-badge {
-    color: #1a7f37;
-    font-weight: 600;
-  }
-  .gate-model-del {
-    flex: 0 0 auto;
-    border: 0;
-    border-left: 1px solid #f0eef6;
-    background: none;
-    color: #b3261e;
+  .gate-pick {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 10px 12px;
+    border-radius: var(--r-md);
+    border: 1px solid var(--line);
+    background: var(--surface);
+    font: inherit;
     cursor: pointer;
-    padding: 0 0.5rem;
-    font-size: 0.85rem;
   }
-  .gate-model-del:hover {
-    background: #fce8e6;
+  .gate-nm {
+    font-size: 13.5px;
+    font-weight: 500;
+    color: var(--ink);
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
   }
-  .gate-model-del:disabled {
-    opacity: 0.5;
-    cursor: default;
+  .mini-badge {
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--accent-ink);
+    background: var(--accent-soft);
+    border-radius: var(--r-pill);
+    padding: 1px 6px;
   }
-  .warn-badge {
-    color: #9a5a00;
-    margin-left: 0.2rem;
+  .gate-sz {
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .gate-del {
+    width: 30px;
+    height: 30px;
+    border-radius: var(--r-sm);
+    border: 1px solid var(--line);
+    background: var(--surface);
+    cursor: pointer;
+    font-size: 13px;
   }
   .gate-skip {
-    margin-top: 0.2rem;
-    border: 0;
-    background: #f0f0f4;
-    color: #6a6a72;
-    border-radius: 8px;
-    padding: 0.45rem 0.7rem;
-    font-size: 0.8rem;
+    margin-top: 4px;
+    border: none;
+    background: none;
+    color: var(--muted);
+    font: inherit;
+    font-size: 13px;
     cursor: pointer;
+    padding: 6px;
   }
   .gate-nowebgpu {
-    font-size: 0.84rem;
-    color: #8a5a00;
-    background: #fff4e0;
-    border-radius: 9px;
-    padding: 0.6rem 0.7rem;
-    line-height: 1.45;
+    padding: 12px;
+    border-radius: var(--r-md);
+    background: var(--warn-soft);
+    color: var(--warn);
+    font-size: 13px;
+    line-height: 1.5;
   }
 </style>
