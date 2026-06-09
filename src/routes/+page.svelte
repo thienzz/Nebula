@@ -1,5 +1,5 @@
 <script lang="ts">
-  // Nebula workspace — the "Obsidian DNA" surfaces on the REAL RAG pipeline, now with
+  // Nebula workspace — the note-taking surfaces on the REAL retrieval pipeline, now with
   // multi-format ingestion: drop PDF/CSV/TXT/MD → intake → Markdown Proxy Note (source
   // backlink, original untouched) → chunk → bge embed → SurrealDB HNSW (indxdb) → retrieve
   // → WebLLM grounded answer. 40/60 resizable split (FR-UI-001); Magic Jump scroll+highlight
@@ -1928,7 +1928,7 @@
 <main class="shell">
   <header class="topbar">
     <span class="brand">✦ Nebula</span>
-    <span class="tag">local-first RAG · Obsidian DNA</span>
+    <span class="tag">notes that think · nothing leaves your device</span>
     <button class="eject" onclick={openSwitcher} title="Quick switch to a note (Ctrl/⌘+K)">
       ⌘K Switch
     </button>

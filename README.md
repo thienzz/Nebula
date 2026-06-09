@@ -1,6 +1,6 @@
 # Nebula
 
-> **Your private AI notes vault — open a tab, install nothing, and nothing ever leaves your machine.**
+> **Notes that think. Nothing leaves your device.**
 
 [![Deploy to GitHub Pages](https://github.com/thienzz/Nebula/actions/workflows/deploy.yml/badge.svg)](https://github.com/thienzz/Nebula/actions/workflows/deploy.yml)
 [![Live demo](https://img.shields.io/badge/%E2%96%B6_live_demo-thienzz.github.io%2FNebula-7c5cff)](https://thienzz.github.io/Nebula/)
@@ -9,17 +9,17 @@
 
 **▶ Try it live — [thienzz.github.io/Nebula](https://thienzz.github.io/Nebula/)** · no install, no account, nothing leaves your browser. The first visit seeds a demo **"Aurora deal war-room"** vault (the [walkthrough below](#-a-deal-war-room--from-scattered-notes-to-a-winning-play)) you can build a knowledge graph over and query offline. *Chat needs a WebGPU browser (Chrome/Edge/Arc, Safari 18+); semantic search works everywhere.*
 
-Nebula is a local-first knowledge base for the AI era that runs **entirely in your browser**. Your notes,
+Nebula is a private AI knowledge base that runs **entirely in your browser**. Your notes,
 the vector database, the embedding model, and the chat LLM all live in your browser's own storage and run on
 **your** GPU — **zero servers, zero telemetry, zero external calls by default.** No account, no upload, no
-cloud bill. And every note is just a plain `.md` file: one click exports the whole vault to Obsidian, so
-nothing is ever held hostage.
+cloud bill. And every note is just a plain `.md` file: one click exports the whole vault as portable
+Markdown — yours to take anywhere — so nothing is ever held hostage.
 
 **Two products in one browser tab:**
 
 - 🧠 **The Vault** — write Markdown and hold a *grounded, cited* conversation with your own knowledge, fully
-  offline: semantic search, an on-device chat LLM, an entity **knowledge graph + GraphRAG**, and the full
-  "Obsidian DNA" (wikilinks, backlinks, ⌘K quick switcher, daily notes, templates).
+  offline: semantic search, an on-device chat LLM, an entity **knowledge graph + GraphRAG**, and a full
+  note-taking layer (wikilinks, backlinks, ⌘K quick switcher, daily notes, templates).
 - 🎯 **The Context Engine** — when you *do* want a frontier model, Nebula surfaces the most relevant ~5% of
   your notes and compiles it into a **token-counted, redactable** block to paste into Claude/GPT. The big
   model gets concentrated signal, not your whole folder — and you choose exactly what leaves the device.
@@ -137,9 +137,9 @@ WebGPU chat runs on a real GPU box or a driven browser.
 
 Nebula ingests **PDF / CSV / TXT / MD**; every import becomes a portable **Markdown Proxy Note**
 (`notes/<stem>.md` with a `source:` backlink) over the untouched original in `sources/`, so
-Export Vault round-trips 1:1 into Obsidian.
+Export Vault round-trips 1:1 to portable Markdown — open it in any editor.
 
-The **"Obsidian DNA"** layer (Export Vault, the Weaver auto-wikilinks, the Micro-Map retrieval
+The **note-taking layer** (Export Vault, the Weaver auto-wikilinks, the Micro-Map retrieval
 sub-graph, lazy-YAML auto-tagging, Magic Jump) has its cores implemented, wired into the app, and
 live-verified. Note authoring (create / edit / rename /
 move / delete), daily notes + templates, a file tree + tag pane, backlinks + unlinked mentions, a Ctrl/⌘-K
@@ -150,6 +150,6 @@ quick switcher, and per-folder/tag scope for the Context Compiler all ship in th
 `InferenceProvider` (ADR-001) is the seam: `WebLLMProvider` (WebGPU, Phase 1) and a deterministic mock
 implement it identically, so product logic never depends on the GPU. The SurrealDB index is a rebuildable
 **derived cache** — your note bodies are the source of truth, and **Export Vault** hands you the whole thing
-as plain `.md` for Obsidian any time (nothing is locked inside a browser store).
+as plain `.md` any time (nothing is locked inside a browser store).
 
 > Stable identifiers (`FR-`, `US-`, `TC-`, `T-`, `ADR-`) thread through the code — grep them.
