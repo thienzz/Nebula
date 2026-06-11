@@ -1283,12 +1283,20 @@ Set **Scope → trip/** and ask *"Summarize our Japan trip"* — you'll only eve
     try {
       let extracted = 0;
       let skipped = 0;
-      for (const n of vault) {
-        if (n.docId === TOUR_DOC) continue; // the meta tour note never joins the graph (would bridge topics)
-        status = `extracting entities: ${shortName(n.docId)}…`;
+      const todo = vault.filter((n) => n.docId !== TOUR_DOC); // tour note never joins the graph
+      let i = 0;
+      for (const n of todo) {
+        i++;
+        status = `extracting entities: ${shortName(n.docId)} (${i}/${todo.length})…`;
         const r = await pipe.indexGraph(n.docId, n.text).catch(() => 0);
         if (r === -1) skipped++;
-        else if (r > 0) extracted++;
+        else if (r > 0) {
+          extracted++;
+          // Show entities as they land — refresh the pane after EACH extracted note so the graph
+          // fills in progressively instead of staying empty until the whole (slow) LLM pass ends.
+          // (Skipped notes don't change the graph, so they don't trigger a read.)
+          await refreshEntities();
+        }
       }
       await refreshEntities();
       graphStale = false; // the whole vault was just (re)extracted — nothing is behind anymore

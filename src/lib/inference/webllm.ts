@@ -27,6 +27,13 @@ const MAX_CONTEXT_TOKENS = 4096;
 // entirely. Persistence is equivalent (IndexedDB on the stable strictPort origin).
 const APP_CONFIG: webllm.AppConfig = { ...webllm.prebuiltAppConfig, cacheBackend: 'indexeddb' };
 
+// JSON-mode (grammar-constrained) generation for the archivist tasks (auto-tag, entity extraction):
+// the model emits ONLY a valid JSON object and STOPS at its closing brace, instead of small models
+// rambling on to max_tokens — faster decode AND always parseable (no wasted "unparseable" segments).
+// Disabled for the rest of the session if a model build rejects response_format, so a save never
+// hard-fails over a missing feature.
+let jsonModeOK = true;
+
 export class WebLLMProvider implements InferenceProvider {
   readonly id = 'webllm' as const;
   private engine: webllm.MLCEngineInterface | null = null;
@@ -135,11 +142,28 @@ export class WebLLMProvider implements InferenceProvider {
    */
   async complete(prompt: string, opts: { maxTokens?: number } = {}): Promise<string> {
     if (!this.engine) throw new Error('Model not loaded');
+    const max_tokens = opts.maxTokens ?? 512;
+    const messages = [{ role: 'user' as const, content: prompt }];
+    if (jsonModeOK) {
+      try {
+        const res = await this.engine.chat.completions.create({
+          stream: false,
+          temperature: 0,
+          max_tokens,
+          response_format: { type: 'json_object' },
+          messages
+        });
+        return res.choices[0]?.message?.content ?? '';
+      } catch (e) {
+        jsonModeOK = false; // fall back once; stay on plain decode for the session
+        console.warn('Nebula: JSON-mode generation unsupported here — using plain decode:', e);
+      }
+    }
     const res = await this.engine.chat.completions.create({
       stream: false,
       temperature: 0,
-      max_tokens: opts.maxTokens ?? 512,
-      messages: [{ role: 'user', content: prompt }]
+      max_tokens,
+      messages
     });
     return res.choices[0]?.message?.content ?? '';
   }
