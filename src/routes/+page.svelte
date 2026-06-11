@@ -669,7 +669,8 @@ Set **Scope → trip/** and ask *"Summarize our Japan trip"* — you'll only eve
     }>;
     indexGraph: (docId: string, text: string) => Promise<number>;
     indexGraphFast: (
-      docs: { docId: string; text: string }[]
+      docs: { docId: string; text: string }[],
+      onProgress?: (done: number, total: number) => void | Promise<void>
     ) => Promise<Map<string, IngestGraphResult>>;
     indexGraphVault: (
       docs: { docId: string; text: string }[],
@@ -885,7 +886,7 @@ Set **Scope → trip/** and ask *"Summarize our Japan trip"* — you'll only eve
       graphRag: (v, opts) => store.graphRagSearch(v, opts),
       indexGraph,
       // Tier-0 instant graph: proper nouns + wikilinks + co-occurrence, no model, milliseconds.
-      indexGraphFast: (docs) => ingestVaultGraphFast(store, docs),
+      indexGraphFast: (docs, onProgress) => ingestVaultGraphFast(store, docs, onProgress),
       // Vault-wide rebuild: same generator seam, but short notes are PACKED into batched LLM calls
       // (one generation extracts several notes) — the per-note fixed cost was what made "build
       // graph" on a many-note vault take minutes. Hash-unchanged notes still cost zero calls.
@@ -1151,10 +1152,12 @@ Set **Scope → trip/** and ask *"Summarize our Japan trip"* — you'll only eve
     let entSum = 0;
     if (graphJobs.length) {
       try {
-        const fast = await pipe.indexGraphFast(
-          graphJobs.map((j) => ({ docId: j.docId, text: j.body }))
+        await pipe.indexGraphFast(
+          graphJobs.map((j) => ({ docId: j.docId, text: j.body })),
+          async () => {
+            await refreshEntities(); // trickle entities into the pane during a big bulk import
+          }
         );
-        if ([...fast.values()].some((r) => r.status === 'ingested')) await refreshEntities();
       } catch {
         /* instant tier is best-effort too — the LLM tier below still runs */
       }
@@ -1326,9 +1329,13 @@ Set **Scope → trip/** and ask *"Summarize our Japan trip"* — you'll only eve
       const todo = vault.filter((n) => n.docId !== TOUR_DOC); // tour note never joins the graph
       const docs = todo.map((n) => ({ docId: n.docId, text: n.text }));
 
-      // PHASE 1 — entities appear NOW, before any model is even loaded.
+      // PHASE 1 — entities appear NOW, before any model is even loaded. On a big vault the pane
+      // trickles in via onProgress instead of waiting for the whole instant pass to persist.
       status = 'building graph…';
-      const fast = await pipe.indexGraphFast(docs);
+      const fast = await pipe.indexGraphFast(docs, async (done, total) => {
+        status = `building graph… ${done}/${total}`;
+        await refreshEntities();
+      });
       const fastIngested = [...fast.values()].filter((r) => r.status === 'ingested').length;
       if (fastIngested > 0) await refreshEntities();
       status = `graph ready · ${entityIndex.length} entities — enriching with the model…`;

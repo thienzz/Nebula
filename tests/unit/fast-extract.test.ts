@@ -139,4 +139,33 @@ describe('ingestVaultGraphFast — tier-0 pass', () => {
     expect(r.get('a')?.status).toBe('no_graph');
     expect(hashes.has('a')).toBe(false);
   });
+
+  it('ticks onProgress during a bulk import so the pane can trickle in (final settle always fires)', async () => {
+    const { store, texts } = fakeStore();
+    const docs = Array.from({ length: 20 }, (_, i) => {
+      const text = `Khoa Trần gặp Vinamilk tại Đà Nẵng về dự án Mercury ${i}.`;
+      texts.set(`d${i}`, text);
+      return { docId: `d${i}`, text };
+    });
+    const ticks: Array<[number, number]> = [];
+    await ingestVaultGraphFast(store, docs, (done, total) => void ticks.push([done, total]));
+    // TICK_EVERY = 8 → ticks at 8, 16, and a final settle at 20.
+    expect(ticks).toEqual([
+      [8, 20],
+      [16, 20],
+      [20, 20]
+    ]);
+  });
+
+  it('does not double-fire the final settle when it lands on a tick boundary', async () => {
+    const { store, texts } = fakeStore();
+    const docs = Array.from({ length: 8 }, (_, i) => {
+      const text = `Lan Phạm ký với FPT tại Huế cho dự án Saturn ${i}.`;
+      texts.set(`d${i}`, text);
+      return { docId: `d${i}`, text };
+    });
+    const ticks: Array<[number, number]> = [];
+    await ingestVaultGraphFast(store, docs, (done, total) => void ticks.push([done, total]));
+    expect(ticks).toEqual([[8, 8]]); // the boundary tick reset sinceTick, so no extra final fire
+  });
 });
