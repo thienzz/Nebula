@@ -213,12 +213,13 @@ export class WebLLMProvider implements InferenceProvider {
     const prompt = assemblePrompt(req.query, req.context, {
       // WORD budget sized to fit the model's real-token window after the system prompt + answer.
       maxContextTokens: contextWordBudget(req.maxTokens),
-      mode: req.answerMode
+      mode: req.answerMode,
+      answerLanguage: req.answerLanguage // pin the answer to the UI language when set
     });
     if (prompt.kind === 'no_results') {
       return {
         requestId: req.requestId,
-        text: NO_RESULTS_MESSAGE,
+        text: req.noResultsMessage ?? NO_RESULTS_MESSAGE, // localized line passed by the UI
         citations: [],
         ttftMs: 0,
         tokensPerSec: 0
@@ -272,7 +273,7 @@ export class WebLLMProvider implements InferenceProvider {
     let cleaned = normalizeCitationMarkers(stripPromptEcho(text));
     if (!cleaned.trim() && text.trim()) cleaned = text.trim();
     if (!cleaned.trim()) {
-      cleaned = EMPTY_ANSWER_MESSAGE;
+      cleaned = req.emptyAnswerMessage ?? EMPTY_ANSWER_MESSAGE; // localized fallback from the UI
       onToken(cleaned);
     }
 

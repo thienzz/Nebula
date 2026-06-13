@@ -72,6 +72,9 @@ export const vi: Dict = {
   'ask.placeholder': 'Đặt câu hỏi về ghi chú của bạn…',
   'ask.send': 'Hỏi',
   'ask.runsLocal': 'Chạy trên máy bạn',
+  'ask.noResults': 'Tôi không tìm thấy gì về điều đó trong ghi chú của bạn.',
+  'ask.emptyAnswer':
+    'Tôi tìm thấy ghi chú liên quan nhưng lần này chưa soạn được câu trả lời — xem các nguồn bên dưới, hoặc thử diễn đạt lại câu hỏi.',
 
   'mode.reason': 'Suy luận giúp tôi',
   'mode.reasonAdv': 'Suy luận',

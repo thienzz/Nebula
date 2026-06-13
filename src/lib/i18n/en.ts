@@ -72,6 +72,9 @@ export const en: Dict = {
   'ask.placeholder': 'Ask a question about your notes…',
   'ask.send': 'Ask',
   'ask.runsLocal': 'Runs on your device',
+  'ask.noResults': "I couldn't find anything about that in your notes.",
+  'ask.emptyAnswer':
+    "I found relevant notes but couldn't compose an answer this time — see the sources below, or try rephrasing the question.",
 
   // mode chips (plain labels by default; technical names in advanced mode)
   'mode.reason': 'Think it through',

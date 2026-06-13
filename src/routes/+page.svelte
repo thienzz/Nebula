@@ -757,6 +757,9 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
           modelId: string;
           maxTokens: number;
           answerMode: 'grounded' | 'reason';
+          answerLanguage?: string;
+          noResultsMessage?: string;
+          emptyAnswerMessage?: string;
           history?: { query: string; answer: string }[];
         },
         onTok: (t: string) => void,
@@ -2263,7 +2266,12 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
           history,
           modelId,
           maxTokens: answerMode === 'reason' ? 1024 : 512,
-          answerMode
+          answerMode,
+          // Answers follow the UI language: a Vietnamese interface always gets Vietnamese answers,
+          // even for English notes/questions (the no-results line is localized too).
+          answerLanguage: SUPPORTED.find((l) => l.code === getLocale())?.label,
+          noResultsMessage: t('ask.noResults'),
+          emptyAnswerMessage: t('ask.emptyAnswer')
         },
         (t) => {
           answer += t;

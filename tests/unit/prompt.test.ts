@@ -124,6 +124,18 @@ describe('assemblePrompt', () => {
     }
   });
 
+  it('answerLanguage pins the answer language without disturbing the default (UI-locale)', () => {
+    const def = assemblePrompt('When does it ship?', hits);
+    const vi = assemblePrompt('When does it ship?', hits, { answerLanguage: 'Vietnamese' });
+    if (def.kind === 'grounded' && vi.kind === 'grounded') {
+      expect(def.system).toBe(SYSTEM_PROMPT); // omitted → unchanged (and prompt-equality tests hold)
+      expect(vi.system).toContain('Vietnamese'); // directive prepended
+      expect(vi.system).toContain('overrides every other language instruction');
+      expect(vi.system.endsWith(SYSTEM_PROMPT)).toBe(true); // base prompt preserved underneath
+      expect(vi.user).toBe(def.user); // only the system prompt changes
+    }
+  });
+
   it('no-results guard: grounded + empty hits → no model call (no fabrication)', () => {
     const r = assemblePrompt('anything', [], { mode: 'grounded' });
     expect(r).toEqual({ kind: 'no_results', message: NO_RESULTS_MESSAGE });

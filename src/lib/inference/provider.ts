@@ -19,6 +19,13 @@ export interface GenerateRequest {
   modelId: string;
   maxTokens: number;
   answerMode?: 'grounded' | 'reason'; // strict RAG vs reason-with-the-notes (FR-CHAT-005)
+  // Force the answer's language (e.g. 'Vietnamese') regardless of the note/question language — driven
+  // by the UI locale. Omitted → the model replies in the language of the question.
+  answerLanguage?: string;
+  // Localized "no relevant notes" line (UI-locale). Omitted → the English default.
+  noResultsMessage?: string;
+  // Localized fallback shown when the model returns an empty answer. Omitted → the English default.
+  emptyAnswerMessage?: string;
   // Prior Q→A turns of this Ask conversation, replayed so a follow-up keeps the thread (FR-CHAT-006).
   // Empty/omitted for the first question. Each turn's grounding context is NOT re-sent — only the
   // running dialogue — while THIS turn carries its own freshly-retrieved context.

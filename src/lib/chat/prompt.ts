@@ -52,6 +52,20 @@ export interface AssembleOptions {
   maxContextTokens?: number; // drop lowest-scoring chunks first if exceeded (never overflow)
   countTokens?: TokenCounter;
   mode?: AnswerMode; // 'grounded' (default, strict RAG) | 'reason' (apply knowledge with the notes)
+  // Force the answer language (e.g. 'Vietnamese'), from the UI locale. When set, a strong directive is
+  // prepended to the system prompt that OVERRIDES the default "match the question's language" rule —
+  // so a Vietnamese UI always gets a Vietnamese answer even for English notes/questions. Omitted →
+  // the system prompt's default behavior (reply in the question's language) is unchanged.
+  answerLanguage?: string;
+}
+
+/** The system-prompt override that pins the answer to one language (UI-locale driven). */
+export function languageDirective(language: string): string {
+  return (
+    `Write your ENTIRE response in ${language}. Use only ${language} — this overrides every other ` +
+    `language instruction below: answer in ${language} even if the notes or the question are written ` +
+    `in a different language. Keep proper nouns and code as-is.`
+  );
 }
 
 function chunkBlock(hit: SearchHit, n: number): string {
@@ -180,7 +194,12 @@ export function assemblePrompt(
   const user = hasContext
     ? `Notes:\n${blocks}\n\n${directive}: ${query}`
     : `${directive}: ${query}`;
-  const system = mode === 'reason' ? SYSTEM_PROMPT_REASON : SYSTEM_PROMPT;
+  const base = mode === 'reason' ? SYSTEM_PROMPT_REASON : SYSTEM_PROMPT;
+  // Pin the answer language (UI locale) by prepending a strong override; left untouched when omitted so
+  // the default "reply in the question's language" rule (and the prompt-equality tests) still hold.
+  const system = opts.answerLanguage
+    ? `${languageDirective(opts.answerLanguage)}\n\n${base}`
+    : base;
 
   return { kind: 'grounded', system, user, contextOrder };
 }
