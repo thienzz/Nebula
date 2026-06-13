@@ -9,6 +9,7 @@
   import 'katex/dist/katex.min.css'; // self-hosted math styles + fonts (bundled, zero external calls)
   import { onMount, tick } from 'svelte';
   import Coachmarks, { type Step as CoachStep } from '$lib/onboard/Coachmarks.svelte';
+  import { t, getLocale, cycleLocale, SUPPORTED } from '$lib/i18n/i18n.svelte';
   import type { SearchHit } from '$lib/inference/provider';
   import type { NoteRecord, ExpandedHit } from '$lib/db/store';
   import { buildTitleIndex, notePreview } from '$lib/weave/weaver';
@@ -642,40 +643,35 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
   // is dismissed. Deliberately jargon-free: it never says "index", "embedding", "RAG" or "graph",
   // only what the user gets. Re-runnable any time via the "Take a tour" topbar button.
   let tourOn = $state(false);
-  const TOUR_STEPS: CoachStep[] = [
-    {
-      title: '👋 Welcome to Nebula',
-      body: 'Nebula turns your notes into something you can ask questions about — and everything runs right here on your device. Nothing is ever uploaded. Here are the four things worth knowing.'
-    },
+  // $derived so the tour re-translates instantly when the UI language changes (i18n).
+  const TOUR_STEPS: CoachStep[] = $derived([
+    { title: t('tour.welcome.title'), body: t('tour.welcome.body') },
     {
       selector: '[data-coach="ask"]',
       placement: 'left',
-      title: 'Ask your notes anything',
-      body: 'Type a question here — like “What’s the total budget for the trip?” — and Nebula answers using your own notes, with links back to where it found each fact. Press ⌘J to jump here anytime.'
+      title: t('tour.ask.title'),
+      body: t('tour.ask.body')
     },
     {
       selector: '[data-coach="modes"]',
       placement: 'top',
-      title: 'Two ways to answer',
-      body: '“Just quote my notes” sticks strictly to what you wrote. “Think it through” lets the assistant reason and give advice. Pick whichever fits your question.'
+      title: t('tour.modes.title'),
+      body: t('tour.modes.body')
     },
     {
       selector: '[data-coach="graph"]',
       placement: 'right',
-      title: 'See how your notes connect',
-      body: 'Nebula automatically links notes that share the same people, places and topics — even when they don’t share any words. Open one to see everything related to it.'
+      title: t('tour.graph.title'),
+      body: t('tour.graph.body')
     },
     {
       selector: '[data-coach="new"]',
       placement: 'right',
-      title: 'Make it your own',
-      body: 'Add your own notes with the + button, or just drag in a PDF or spreadsheet — it becomes searchable too. When you’re ready, you can delete the example notes.'
+      title: t('tour.new.title'),
+      body: t('tour.new.body')
     },
-    {
-      title: '✨ You’re all set',
-      body: 'Try asking a question in the panel on the right. You can replay this tour anytime from the “?” button at the top.'
-    }
-  ];
+    { title: t('tour.done.title'), body: t('tour.done.body') }
+  ]);
   function startTour() {
     tourOn = false; // force a clean remount so the tour always restarts at step 1
     void tick().then(() => (tourOn = true));
@@ -2768,6 +2764,9 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
     {:else if name === 'reset'}<path d="M12.5 5.5A5 5 0 1 0 13 9" /><polyline
         points="12.5,2.5 12.5,5.5 9.5,5.5"
       />
+    {:else if name === 'globe'}<circle cx="8" cy="8" r="6.5" /><path
+        d="M2 8h12M8 1.5c2 2 2 11 0 13M8 1.5c-2 2-2 11 0 13"
+      />
     {/if}
   </svg>
 {/snippet}
@@ -2834,9 +2833,9 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
       <span class="brand-name">Nebula</span>
     </div>
     <div class="tb-center">
-      <button class="omnibox nb-hov nb-focusable" onclick={openSwitcher} title="Search or ask (⌘K)">
+      <button class="omnibox nb-hov nb-focusable" onclick={openSwitcher} title="{t('topbar.search')} (⌘K)">
         <span class="omni-ic">{@render ic('search', 15)}</span>
-        <span class="omni-txt">Search or ask your notes…</span>
+        <span class="omni-txt">{t('topbar.search')}</span>
         <kbd>⌘K</kbd>
       </button>
     </div>
@@ -2846,31 +2845,29 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
         class:loading={modelLoading}
         onclick={reopenModelGate}
         disabled={modelLoading}
-        title={modelLoading
-          ? 'Model is loading — please wait until it finishes before switching'
-          : 'On-device chat model'}
+        title={modelLoading ? t('topbar.modelLoadingTip') : t('topbar.modelTip')}
       >
         <span class="dot {modelLoading ? 'busy' : 'ok'}"></span>{modelById(modelId)?.label ??
-          'Model'}{@render ic('chevdown', 12)}
+          t('topbar.model')}{@render ic('chevdown', 12)}
       </button>
       {#if bgPending > 0}
-        <span class="pill busy-pill" title="Getting your notes ready to search"
-          ><span class="spinner"></span>Reading notes…{bgProgress ? ` ${bgProgress}` : ''}</span
+        <span class="pill busy-pill" title={t('topbar.readingTip')}
+          ><span class="spinner"></span>{t('topbar.reading')}{bgProgress
+            ? ` ${bgProgress}`
+            : ''}</span
         >
       {:else if graphBuilding > 0}
-        <span
-          class="pill busy-pill"
-          title="Your notes are searchable; still linking related ones in the background"
-          ><span class="spinner"></span>Connecting notes…</span
+        <span class="pill busy-pill" title={t('topbar.connectingTip')}
+          ><span class="spinner"></span>{t('topbar.connecting')}</span
         >
       {:else if indexDone}
-        <span class="pill ok-pill" title="Your notes are ready">
+        <span class="pill ok-pill" title={t('topbar.readyTip')}>
           {@render ic('check', 13)}
           {indexDone}</span
         >
       {:else if ready}
-        <span class="pill ok-pill" title="Your notes are ready to search"
-          >{@render ic('check', 13)} Ready</span
+        <span class="pill ok-pill" title={t('topbar.readyTip')}
+          >{@render ic('check', 13)} {t('topbar.ready')}</span
         >
       {/if}
       {#if advanced && embedBackend && embedBackend.device}
@@ -2886,45 +2883,46 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
         </span>
       {:else if embedBackend && embedBackend.device === 'cpu'}
         <!-- Default (plain) mode: surface only the actionable slow-path, no hardware jargon. -->
-        <span
-          class="pill warn-pill"
-          title="This device is running Nebula in a slower mode. For best speed, use Chrome or Edge with hardware acceleration enabled."
-          >Slower mode</span
-        >
+        <span class="pill warn-pill" title={t('topbar.slowerTip')}>{t('topbar.slower')}</span>
       {/if}
+      <button
+        class="icon-btn lang-btn nb-hov nb-press"
+        onclick={cycleLocale}
+        title={t('topbar.language')}
+        aria-label={t('topbar.language')}
+        >{@render ic('globe', 15)}<span class="lang-code">{getLocale().toUpperCase()}</span></button
+      >
       <button
         class="icon-btn nb-hov nb-press"
         onclick={startTour}
-        title="Take a quick tour"
-        aria-label="Take a quick tour">{@render ic('help', 16)}</button
+        title={t('topbar.tour')}
+        aria-label={t('topbar.tour')}>{@render ic('help', 16)}</button
       >
       <a
         class="icon-btn nb-hov nb-press"
         href="https://github.com/thienzz/Nebula"
         target="_blank"
         rel="noopener noreferrer"
-        title="View source on GitHub"
-        aria-label="View source on GitHub">{@render ic('github', 16)}</a
+        title={t('topbar.github')}
+        aria-label={t('topbar.github')}>{@render ic('github', 16)}</a
       >
-      <button class="icon-btn nb-hov nb-press" onclick={exportVault} title="Export vault"
+      <button class="icon-btn nb-hov nb-press" onclick={exportVault} title={t('topbar.export')}
         >{@render ic('download', 16)}</button
       >
       <button
         class="icon-btn nb-hov nb-press"
         class:active={advanced}
         onclick={toggleAdvanced}
-        title={advanced
-          ? 'Advanced mode on — showing technical details'
-          : 'Advanced mode — show technical details'}
+        title={advanced ? t('topbar.advancedOn') : t('topbar.advancedOff')}
         aria-pressed={advanced}>{@render ic('gauge', 16)}</button
       >
       <button
         class="icon-btn nb-hov nb-press"
         onclick={openResetDialog}
-        title="Reset all data — recover from a stuck model or a broken note"
-        aria-label="Reset all data">{@render ic('reset', 16)}</button
+        title={t('topbar.reset')}
+        aria-label={t('topbar.reset')}>{@render ic('reset', 16)}</button
       >
-      <button class="icon-btn nb-hov nb-press" onclick={toggleTheme} title="Toggle theme"
+      <button class="icon-btn nb-hov nb-press" onclick={toggleTheme} title={t('topbar.theme')}
         >{@render ic(theme === 'dark' ? 'sun' : 'moon', 16)}</button
       >
     </div>
@@ -2935,13 +2933,13 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
     <div class="model-banner">
       <span class="spinner"></span>
       <span
-        >Getting your assistant ready · <strong>{modelById(modelId)?.label ?? 'model'}</strong
+        >{t('banner.loading')} · <strong>{modelById(modelId)?.label ?? t('topbar.model')}</strong
         ></span
       >
       <span class="mb-bar"><span class="mb-fill" style="width:{loadPct}%"></span></span>
       <span class="mb-pct">{loadPct}%</span>
       <span class="mb-div"></span>
-      <span class="mb-note">You can search your notes already — no waiting</span>
+      <span class="mb-note">{t('banner.searchNow')}</span>
     </div>
   {/if}
 
@@ -2959,11 +2957,11 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
     >
       <div class="side-scroll">
         <div class="side-head">
-          <span class="label">Vault · {vault.length}</span>
+          <span class="label">{t('side.vault')} · {vault.length}</span>
           <button
             class="ghost-ic nb-hov nb-press"
             data-coach="new"
-            title="New note / folder"
+            title={t('side.newNote')}
             onclick={(e) => openCtxMenu(e, 'root', '')}>{@render ic('plus', 14)}</button
           >
         </div>
@@ -2972,7 +2970,7 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
           <div class="side-head">
             <span class="label">#{activeTag} · {filteredNotes.length}</span><button
               class="link-btn"
-              onclick={() => (activeTag = null)}>clear</button
+              onclick={() => (activeTag = null)}>{t('side.clear')}</button
             >
           </div>
           {#each filteredNotes as note (note.docId)}
@@ -2992,7 +2990,7 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
         {/if}
 
         <div class="side-head mt" data-coach="graph">
-          <span class="label">People, places &amp; topics</span><span class="tree-count"
+          <span class="label">{t('side.entities')}</span><span class="tree-count"
             >{entityIndex.length}</span
           >
         </div>
@@ -3017,16 +3015,18 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
               class="ent-row more-ent nb-hov"
               onclick={() => (showAllEntities = !showAllEntities)}
             >
-              {showAllEntities ? 'Show fewer' : `Show all ${entityIndex.length}`}
+              {showAllEntities ? t('side.showFewer') : t('side.showAll', { n: entityIndex.length })}
             </button>
           {/if}
           <button class="ent-row open-lens nb-hov" onclick={() => switchView('graph')}>
-            <span class="lens-ic">{@render ic('graph', 14)}</span> See connections
+            <span class="lens-ic">{@render ic('graph', 14)}</span> {t('side.seeConnections')}
           </button>
         {:else}
           <button class="build-graph nb-press" onclick={buildVaultGraph} disabled={graphBusy}>
-            {#if graphBusy}<span class="spinner"></span>connecting…{:else}{@render ic('graph', 14)} Connect
-              my notes{/if}
+            {#if graphBusy}<span class="spinner"></span>{t('side.connecting')}{:else}{@render ic(
+                'graph',
+                14
+              )} {t('side.connect')}{/if}
           </button>
         {/if}
         {#if graphStale && entityIndex.length}
@@ -3036,15 +3036,17 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
             class="graph-stale nb-hov"
             onclick={buildVaultGraph}
             disabled={graphBusy}
-            title="New notes aren't connected yet — update to include them"
+            title={t('side.updateConnectionsTip')}
           >
-            {#if graphBusy}<span class="spinner"></span>updating…{:else}{@render ic('graph', 12)} Update
-              connections — new notes pending{/if}
+            {#if graphBusy}<span class="spinner"></span>{t('side.connecting')}{:else}{@render ic(
+                'graph',
+                12
+              )} {t('side.updateConnections')}{/if}
           </button>
         {/if}
 
         {#if tagIndex.length}
-          <div class="side-head mt"><span class="label">Tags</span></div>
+          <div class="side-head mt"><span class="label">{t('side.tags')}</span></div>
           <div class="tagwrap">
             {#each tagIndex as t (t.tag)}
               <button
@@ -3060,7 +3062,7 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
       <div class="side-foot">
         <div class="scope-pill">
           <span class="scope-ic">{@render ic('box', 15)}</span>
-          <span class="scope-lbl">Search in</span>
+          <span class="scope-lbl">{t('side.searchIn')}</span>
           <select
             class="scope-select"
             value={scope
@@ -3069,9 +3071,9 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
                 : `tag:${scope.value}`
               : ''}
             onchange={(e) => setScope(e.currentTarget.value)}
-            title="Limit questions and sharing to one folder or tag"
+            title={t('side.searchInTip')}
           >
-            <option value="">all notes</option>
+            <option value="">{t('side.allNotes')}</option>
             {#if folderScopes.length}
               <optgroup label="Folders"
                 >{#each folderScopes as f (f)}<option value={`folder:${f}`}>{f}/</option
@@ -3096,26 +3098,27 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
         <!-- GRAPH LENS -->
         <div class="lens-head">
           <span class="lens-ic accent">{@render ic('graph', 18)}</span>
-          <span class="lens-title">{advanced ? 'Graph lens' : 'Connections'}</span>
+          <span class="lens-title">{advanced ? t('lens.graphLens') : t('lens.connections')}</span>
           <span class="lens-sub"
-            >{#if advanced}{entityIndex.length} entities · {entityRelationCount} relations{:else}{entityIndex.length}
-              topics · {entityRelationCount} links{/if}</span
+            >{entityIndex.length}
+            {advanced ? t('lens.entities') : t('lens.topics')} · {entityRelationCount}
+            {advanced ? t('lens.relations') : t('lens.links')}</span
           >
           <span class="spacer"></span>
           {#if entityIndex.length}<span class="pill ok-pill"
-              >{@render ic('check', 13)} ready</span
+              >{@render ic('check', 13)} {t('lens.ready')}</span
             >{/if}
           <button
             class="icon-btn nb-hov nb-press"
             onclick={() => switchView('files')}
-            title="Close">{@render ic('close', 15)}</button
+            title={t('lens.close')}>{@render ic('close', 15)}</button
           >
         </div>
         <div class="lens-body">
           {#if graphBusy}
             <div class="center-empty">
               <span class="spinner big"></span>
-              <p>Extracting entities & relations…</p>
+              <p>{t('lens.extracting')}</p>
             </div>
           {:else if selectedEntity && entityLayout}
             {#if entityLayout.nodes.length > 1}
@@ -3197,20 +3200,18 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
                     {/each}
                   </g>
                 </svg>
-                <div class="lens-hint">
-                  Click any node to re-center · drag to pan · scroll to zoom
-                </div>
+                <div class="lens-hint">{t('lens.hint')}</div>
               </div>
             {:else}
               <div class="center-empty">
-                <p>Nothing connected to <strong>{selectedEntity.name}</strong> yet.</p>
-                <button class="ghost-btn" onclick={buildVaultGraph}>↻ Try connecting again</button>
+                <p>{t('lens.nothing', { name: selectedEntity.name })}</p>
+                <button class="ghost-btn" onclick={buildVaultGraph}>{t('lens.retry')}</button>
               </div>
             {/if}
             {#if entityNotes.length}
               <div class="lens-mentions">
                 <div class="label">
-                  Notes mentioning {selectedEntity.name} · {entityNotes.length}
+                  {t('lens.mentions', { name: selectedEntity.name })} · {entityNotes.length}
                 </div>
                 <div class="mention-grid">
                   {#each entityNotes as docId (docId)}
@@ -3226,7 +3227,7 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
           {:else}
             <div class="center-empty">
               <span class="empty-ic">{@render ic('graph', 26)}</span>
-              <p>Pick one to see how it connects across your notes.</p>
+              <p>{t('lens.pickOne')}</p>
             </div>
           {/if}
         </div>
@@ -3252,7 +3253,7 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
             <input
               class="title-input"
               bind:value={draftTitle}
-              placeholder="Note title"
+              placeholder={t('note.title')}
               disabled={savingNote}
             />
             <div class="edit-toolbar">
@@ -3271,7 +3272,7 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
               {#if !editingDocId}<input
                   class="folder-input mono"
                   bind:value={draftFolder}
-                  placeholder="folder — blank = vault root"
+                  placeholder={t('note.folder')}
                   title="Folder, e.g. clients/acme — leave blank to keep the note at the vault root (no folder)"
                   disabled={savingNote}
                 />{/if}
@@ -3282,7 +3283,7 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
                 class="body-input mono"
                 bind:this={bodyEl}
                 bind:value={draftBody}
-                placeholder="Write in Markdown… type [[ to link a note"
+                placeholder={t('note.body')}
                 disabled={savingNote}
                 oninput={onBodyInput}
                 onkeyup={onBodyInput}
@@ -3360,7 +3361,7 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
                 <div class="note-actions">
                   {#if !activeNote.sourcePath}<button
                       class="act-btn nb-hov nb-press"
-                      onclick={() => editNote(activeNote)}>{@render ic('edit', 14)} Edit</button
+                      onclick={() => editNote(activeNote)}>{@render ic('edit', 14)} {t('note.edit')}</button
                     >{/if}
                   <button
                     class="icon-btn nb-hov nb-press"
@@ -3439,20 +3440,17 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
               <div class="center-empty">
                 <span class="empty-ic">{@render ic('file', 26)}</span>
                 <p>
-                  Select a note from the sidebar, or <button class="link-btn" onclick={startNewNote}
-                    >write a new one</button
-                  >.
+                  {t('note.empty')}
+                  <button class="link-btn" onclick={startNewNote}>{t('note.writeNew')}</button>.
                 </p>
-                <p class="dim sm">
-                  Right-click the tree to add · rename · move · delete. Drag a note onto a folder to
-                  move it.
-                </p>
+                <p class="dim sm">{t('note.emptyHint')}</p>
                 <div class="empty-cta">
                   <button class="ghost-btn" onclick={startNewNote}
-                    >{@render ic('plus', 14)} New note</button
+                    >{@render ic('plus', 14)} {t('note.newNote')}</button
                   >
-                  <button class="ghost-btn" onclick={openDailyNote}>Today</button>
-                  <button class="ghost-btn" onclick={() => fileInput?.click()}>Import files</button>
+                  <button class="ghost-btn" onclick={openDailyNote}>{t('note.today')}</button>
+                  <button class="ghost-btn" onclick={() => fileInput?.click()}>{t('note.import')}</button
+                  >
                 </div>
               </div>
             {/if}
@@ -3464,9 +3462,10 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
     <!-- ASK RAIL -->
     <aside class="rail">
       <div class="rail-head">
-        <span class="rail-title">Ask</span>
+        <span class="rail-title">{t('ask.title')}</span>
         <span class="rail-scope"
-          >searching <span class="mono">{scope ? scopeLabel(scope) : 'all notes'}</span></span
+          >{t('ask.searching')}
+          <span class="mono">{scope ? scopeLabel(scope) : t('ask.scopeAll')}</span></span
         >
         <span class="spacer"></span>
         {#if history.length || answer || hits.length}
@@ -3474,7 +3473,7 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
             class="rail-new nb-hov"
             onclick={newConversation}
             disabled={busy}
-            title="Start a new conversation">{@render ic('plus', 13)} New</button
+            title={t('ask.newTip')}>{@render ic('plus', 13)} {t('ask.new')}</button
           >
         {/if}
         <kbd>⌘J</kbd>
@@ -3500,7 +3499,7 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
             <details class="think" open={busy && !answerHtml}>
               <summary>
                 {@render ic('graph', 13)}
-                <span>{busy && !answerHtml ? 'Thinking…' : 'Thoughts'}</span>
+                <span>{busy && !answerHtml ? t('ask.thinking') : t('ask.thoughts')}</span>
               </summary>
               <div class="think-body prose">{@html reasoningHtml}</div>
             </details>
@@ -3530,7 +3529,8 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
             )}
             <div class="used-strip">
               {#if usage.count > 0}<span class="us-ok"
-                  >{@render ic('check', 13)} used {usage.count}/{hits.length}</span
+                  >{@render ic('check', 13)}
+                  {t('ask.used', { count: usage.count, total: hits.length })}</span
                 >{/if}
               {#if graphInfo}<span class="us-div"></span><span class="us-graph">{graphInfo}</span
                 >{/if}
@@ -3540,7 +3540,7 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
                   >{@render ic('bolt', 12)}{ttft} ms · {tps} tok/s</span
                 >{/if}
             </div>
-            <div class="label">Sources</div>
+            <div class="label">{t('ask.sources')}</div>
             <div class="src-list">
               {#each hits as h, i (h.chunkId)}
                 {@const used = usage.used.has(h.chunkId)}
@@ -3550,14 +3550,15 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
                   <span class="src-path mono">{h.docId}</span>
                   {#if viaGraph}<span class="src-graph"
                       >↳ {(graphShared.get(h.chunkId)?.sharedEntities ?? []).join(', ')}</span
-                    >{:else}<span class="src-why">{advanced ? 'vector' : 'match'}</span>{/if}
+                    >{:else}<span class="src-why">{advanced ? t('ask.vector') : t('ask.match')}</span
+                    >{/if}
                   {#if advanced}<span class="src-score mono">{h.score.toFixed(2)}</span>{/if}
                 </button>
               {/each}
             </div>
             {#if graph}
               <div class="micromap">
-                <div class="label sm">{advanced ? 'Retrieval sub-graph' : 'How this answer was found'}</div>
+                <div class="label sm">{advanced ? t('ask.subgraph') : t('ask.howFound')}</div>
                 <svg
                   width="100%"
                   height={32 + graph.nodes.filter((n) => n.kind === 'chunk').length * 26}
@@ -3591,17 +3592,14 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
               </div>
             {/if}
             <button class="compile-btn nb-press" onclick={openCompileFromHits}
-              >{@render ic('box', 16)} Share with another AI</button
+              >{@render ic('box', 16)} {t('ask.share')}</button
             >
           {/if}
         {:else}
-          <p class="rail-idle">
-            Ask anything about your notes. Answers come only from what you’ve written, and link back
-            to where each fact came from.
-          </p>
-          <div class="label">Try</div>
+          <p class="rail-idle">{t('ask.idle')}</p>
+          <div class="label">{t('ask.try')}</div>
           <div class="try-list">
-            {#each ['What did we decide and why?', 'Who owns what — and how does it connect?', 'Summarize the open risks'] as s}
+            {#each [t('ask.try1'), t('ask.try2'), t('ask.try3')] as s}
               <button
                 class="try nb-hov"
                 onclick={() => {
@@ -3620,7 +3618,7 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
           <textarea
             bind:value={query}
             rows="1"
-            placeholder="Ask a question about your notes…"
+            placeholder={t('ask.placeholder')}
             disabled={busy}
             onkeydown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey) {
@@ -3634,7 +3632,7 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
             class:on={query.trim()}
             onclick={ask}
             disabled={!ready || busy}
-            aria-label="Ask">{@render ic('send', 16)}</button
+            aria-label={t('ask.send')}>{@render ic('send', 16)}</button
           >
         </div>
         <div class="composer-foot">
@@ -3643,25 +3641,25 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
               class="mchip nb-hov"
               class:on={answerMode === 'reason'}
               onclick={() => (answerMode = 'reason')}
-              title="Let the assistant reason over your notes and give advice"
-              >{@render ic('bolt', 12)} {advanced ? 'Reason' : 'Think it through'}</button
+              title={t('mode.reasonTip')}
+              >{@render ic('bolt', 12)} {advanced ? t('mode.reasonAdv') : t('mode.reason')}</button
             >
             <button
               class="mchip nb-hov"
               class:on={answerMode === 'grounded'}
               onclick={() => (answerMode = 'grounded')}
-              title="Stick strictly to what your notes actually say"
-              >{advanced ? 'Grounded' : 'Just quote my notes'}</button
+              title={t('mode.groundedTip')}
+              >{advanced ? t('mode.groundedAdv') : t('mode.grounded')}</button
             >
             <button
               class="mchip nb-hov"
               class:on={graphRagOn}
               onclick={() => (graphRagOn = !graphRagOn)}
-              title="Also pull in related notes that share the same people, places or topics"
-              >{@render ic('graph', 12)} {advanced ? 'GraphRAG' : 'Connect ideas'}</button
+              title={t('mode.graphTip')}
+              >{@render ic('graph', 12)} {advanced ? t('mode.graphAdv') : t('mode.graph')}</button
             >
           </div>
-          <span class="dim sm">Runs on your device</span>
+          <span class="dim sm">{t('ask.runsLocal')}</span>
         </div>
       </div>
     </aside>
@@ -4008,11 +4006,8 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
     <div class="overlay center" role="presentation">
       <div class="gate nb-rise" role="dialog" aria-modal="true" aria-label="Choose a model">
         <div class="gate-head">
-          <strong>Your private AI assistant</strong>
-          <p class="dim sm">
-            Runs entirely on your computer — downloaded once, then works offline. No account, and
-            nothing ever leaves your device.
-          </p>
+          <strong>{t('gate.title')}</strong>
+          <p class="dim sm">{t('gate.desc')}</p>
         </div>
         {#if gpu?.ok}
           {@const rec = recommendModel(true, hwHint)}
@@ -4020,8 +4015,8 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
               class="gate-auto nb-press"
               onclick={chooseAutoModel}
               disabled={modelLoading}
-              ><span>★ Recommended — {rec.label}</span><small class="dim"
-                >best fit for your device · {formatSize(rec.sizeMB)}</small
+              ><span>{t('gate.recommended', { label: rec.label })}</span><small class="dim"
+                >{t('gate.bestFit', { size: formatSize(rec.sizeMB) })}</small
               ></button
             >{/if}
           <div class="gate-list">
@@ -4034,11 +4029,11 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
                   disabled={modelLoading || deletingModel === m.id}
                 >
                   <span class="gate-nm"
-                    >{m.label}{#if m.multilingual}<span class="mini-badge">multilingual</span
+                    >{m.label}{#if m.multilingual}<span class="mini-badge">{t('gate.multilingual')}</span
                       >{/if}</span
                   >
                   <span class="gate-sz mono"
-                    >{#if cached}<span class="ok">✓ ready</span>{:else}{formatSize(
+                    >{#if cached}<span class="ok">{t('gate.cached')}</span>{:else}{formatSize(
                         m.sizeMB
                       )}{#if needsOomAck(m.id)}
                         ↓{/if}{/if}</span
@@ -4046,26 +4041,21 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
                 </button>
                 {#if cached}<button
                     class="gate-del nb-hov"
-                    title="Remove from this browser"
+                    title={t('gate.removeTip')}
                     onclick={() => deleteModelFromCache(m.id)}
                     disabled={!!deletingModel}>{deletingModel === m.id ? '…' : '🗑'}</button
                   >{/if}
               </div>
             {/each}
           </div>
-          <button class="gate-skip" onclick={closeModelGate}
-            >Skip for now — search and notes still work</button
-          >
+          <button class="gate-skip" onclick={closeModelGate}>{t('gate.skip')}</button>
         {:else}
-          <div class="gate-nowebgpu">
-            ⚠ This device can’t run the AI assistant, but searching and writing notes still work
-            fully. For the assistant, try Chrome or Edge on a computer with a graphics card.
-          </div>
-          <button class="gate-skip" onclick={closeModelGate}>Continue</button>
+          <div class="gate-nowebgpu">{t('gate.noWebgpu')}</div>
+          <button class="gate-skip" onclick={closeModelGate}>{t('gate.continue')}</button>
         {/if}
         <div class="gate-danger">
-          <span class="dim sm">Something broken — a stuck model or a note that won’t load?</span>
-          <button class="reset-link" onclick={openResetDialog}>Reset all data…</button>
+          <span class="dim sm">{t('gate.brokenHint')}</span>
+          <button class="reset-link" onclick={openResetDialog}>{t('gate.resetLink')}</button>
         </div>
       </div>
     </div>
@@ -4075,25 +4065,22 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
     <div class="overlay center" role="presentation">
       <div class="gate danger nb-rise" role="dialog" aria-modal="true" aria-label="Reset all data">
         <div class="gate-head">
-          <strong class="danger-title">⚠ Reset all data?</strong>
-          <p class="dim sm">
-            This permanently <strong>erases everything Nebula stored on this device</strong> and
-            cannot be undone:
-          </p>
+          <strong class="danger-title">{t('reset.title')}</strong>
+          <p class="dim sm">{t('reset.lead')}</p>
         </div>
         <ul class="reset-list">
-          <li>📝 <strong>All your notes</strong> — they live only here, not as files</li>
-          <li>🔎 the search index &amp; the knowledge graph</li>
-          <li>🤖 downloaded AI models (you’ll re-download next time)</li>
-          <li>⚙️ settings, theme, and the tour state</li>
+          <li>📝 {t('reset.item.notes')}</li>
+          <li>🔎 {t('reset.item.index')}</li>
+          <li>🤖 {t('reset.item.models')}</li>
+          <li>⚙️ {t('reset.item.settings')}</li>
         </ul>
         <div class="reset-tip">
-          💡 Want to keep your notes? <button class="link-btn" onclick={exportVault}
-            >Export your vault first</button
-          > — then come back.
+          💡 {t('reset.tip')}
+          <button class="link-btn" onclick={exportVault}>{t('reset.exportFirst')}</button>
+          {t('reset.thenBack')}
         </div>
         <label class="reset-arm">
-          Type <strong>{RESET_WORD}</strong> to confirm:
+          {t('reset.typeToConfirm', { word: RESET_WORD })}
           <input
             class="reset-input"
             bind:value={resetConfirm}
@@ -4104,13 +4091,17 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
           />
         </label>
         <div class="reset-actions">
-          <button class="gate-skip" onclick={closeResetDialog} disabled={resetting}>Cancel</button>
+          <button class="gate-skip" onclick={closeResetDialog} disabled={resetting}
+            >{t('reset.cancel')}</button
+          >
           <button
             class="reset-go"
             onclick={resetAllData}
             disabled={resetting || resetConfirm.trim().toUpperCase() !== RESET_WORD}
           >
-            {#if resetting}<span class="spinner"></span>Erasing…{:else}Erase everything{/if}
+            {#if resetting}<span class="spinner"></span>{t('reset.erasing')}{:else}{t(
+                'reset.erase'
+              )}{/if}
           </button>
         </div>
       </div>
@@ -4263,6 +4254,16 @@ Set the search to **trip/** and ask *"Summarize our Japan trip"* — you'll only
     border-color: var(--accent-rim);
     background: var(--accent-soft);
     color: var(--accent-ink);
+  }
+  .lang-btn {
+    width: auto;
+    gap: 4px;
+    padding: 0 8px;
+  }
+  .lang-code {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
   }
   .pill {
     display: inline-flex;

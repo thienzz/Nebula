@@ -16,6 +16,7 @@ const K_FOLDERS = `${NS}.emptyFolders`;
 const K_VIEW = `${NS}.view`;
 const K_THEME = `${NS}.theme`;
 const K_ADVANCED = `${NS}.advanced`;
+const K_LOCALE = `${NS}.locale`;
 
 function store(): Storage | null {
   try {
@@ -101,6 +102,16 @@ export function getView(): WorkspaceView {
 }
 export function setView(view: WorkspaceView): void {
   write(K_VIEW, view);
+}
+
+/** UI language (i18n). Persisted across sessions; read by the i18n store at startup. `null` → the
+ *  store falls back to browser detection (navigator.language) then English. */
+export function getLocale(): string | null {
+  const v = read(K_LOCALE);
+  return v && v.trim() ? v : null;
+}
+export function setLocale(locale: string): void {
+  if (locale && locale.trim()) write(K_LOCALE, locale);
 }
 
 /** Advanced mode — surfaces the technical metrics (GPU/CPU speed, answer latency & throughput,

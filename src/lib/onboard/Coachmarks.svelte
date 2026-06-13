@@ -20,6 +20,7 @@
   // resize/scroll listeners and a per-step settle tick, so it stays glued to its target.
 
   import { onMount, tick } from 'svelte';
+  import { t } from '$lib/i18n/i18n.svelte';
 
   let { steps, onDone }: { steps: Step[]; onDone: () => void } = $props();
 
@@ -155,7 +156,7 @@
     class:centered={!pos}
     style={pos ? `left:${pos.left}px; top:${pos.top}px;` : ''}
   >
-    <div class="coach-step">Step {i + 1} of {steps.length}</div>
+    <div class="coach-step">{t('tour.step', { n: i + 1, total: steps.length })}</div>
     <strong class="coach-title">{step?.title}</strong>
     <p class="coach-body">{step?.body}</p>
 
@@ -166,9 +167,9 @@
         {/each}
       </div>
       <div class="coach-actions">
-        <button class="coach-skip" onclick={finish}>Skip</button>
-        {#if i > 0}<button class="coach-btn ghost" onclick={back}>Back</button>{/if}
-        <button class="coach-btn primary" onclick={next}>{isLast ? 'Done' : 'Next'}</button>
+        <button class="coach-skip" onclick={finish}>{t('tour.skip')}</button>
+        {#if i > 0}<button class="coach-btn ghost" onclick={back}>{t('tour.back')}</button>{/if}
+        <button class="coach-btn primary" onclick={next}>{isLast ? t('tour.done') : t('tour.next')}</button>
       </div>
     </div>
   </div>
