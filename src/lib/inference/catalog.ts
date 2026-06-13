@@ -98,10 +98,12 @@ export const CHAT_MODELS: ChatModel[] = [
 // GPUs (verified: Qwen2.5-7B runs in the browser). The ack just prevents a surprise multi-GB pull.
 export const BIG_MODEL_MB = 3500;
 
-/** The id we recommend on a CAPABLE machine — the newest multilingual model, strongest on Vietnamese
- *  and far better than a 3 B at extracting a fact buried in a long note (the small-model weakness that
- *  drove this default). It's a ~5.7 GB download, so the OOM-ack + the picker remain the escape hatches. */
-export const RECOMMENDED_MODEL_ID = 'Qwen3-8B-q4f16_1-MLC';
+/** The id we recommend on a CAPABLE machine — the multilingual 7 B, strong on Vietnamese. Picked over
+ *  the (newer) Qwen3-8B because Qwen3 is a REASONING model: it emits a long <think> phase and often
+ *  stops there without writing a clean grounded answer (the "it didn't answer" failure) — unreliable
+ *  for terse RAG Q&A. Qwen2.5-7B answers DIRECTLY: reliable + faster. ~5.1 GB download; the OOM-ack +
+ *  the picker remain the escape hatches (Qwen3-8B is still offered for anyone who wants its reasoning). */
+export const RECOMMENDED_MODEL_ID = 'Qwen2.5-7B-Instruct-q4f16_1-MLC';
 
 /** The fallback default for a WEAKER machine — the multilingual 3 B (quality/size sweet spot, modest
  *  download). Still a real catalog entry the picker offers. */

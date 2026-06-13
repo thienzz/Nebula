@@ -46,11 +46,11 @@ describe('recommendModel', () => {
     expect(recommendModel(false, { deviceMemoryGB: 32 })).toBeNull();
   });
 
-  it('capable machine (≥8 GB RAM) → the newest multilingual 8B', () => {
+  it('capable machine (≥8 GB RAM) → the multilingual non-reasoning 7B', () => {
     const r = recommendModel(true, { deviceMemoryGB: 16, maxBufferBytes: 2_000_000_000 });
     expect(r?.id).toBe(RECOMMENDED_MODEL_ID);
     expect(r?.multilingual).toBe(true);
-    expect(r?.params).toBe('8B');
+    expect(r?.params).toBe('7B'); // Qwen2.5-7B — direct answers, vs Qwen3-8B's unreliable <think>
   });
 
   it('weaker / unknown machine → the lighter multilingual 3B fallback (ack-free, modest download)', () => {
